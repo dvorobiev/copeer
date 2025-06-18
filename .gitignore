@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Файлы состояния и конфигурации
+config.yaml
+session.json
+copier_state.csv
+mapping.csv
+errors.log
+
+# Системные файлы
+.DS_Store
