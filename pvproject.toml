@@ -1,0 +1,19 @@
+# pyproject.toml
+[project]
+name = "copeer"
+version = "1.0.0"
+description = "A smart utility for parallel copying of large data volumes with a TUI dashboard and resume capability."
+authors = [
+    {name = "Dmitriy Vorobiev", email = "vorobiev.dmitriy@gmailc.com"},
+]
+requires-python = ">=3.8"
+
+# Здесь перечисляем все зависимости из requirements.txt
+dependencies = [
+    "rich",
+    "pyyaml",
+]
+
+[tool.uv]
+# Эта опция помогает uv работать более предсказуемо и воспроизводимо.
+seed = true

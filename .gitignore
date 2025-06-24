@@ -4,15 +4,21 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+
+# Virtual Environments
 env/
 venv/
+.venv/
 
-# Файлы состояния и конфигурации
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated files by the copier script
+# Никогда не добавляйте конфигурацию и состояние в репозиторий!
 config.yaml
 session.json
-copier_state.csv
-mapping.csv
-errors.log
-
-# Системные файлы
-.DS_Store
+*.csv
+*.log
