@@ -31,7 +31,7 @@ from collections import defaultdict
 console = Console()
 
 # --- ИЗМЕНЕНИЕ: ВЕРСИЯ ---
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 # --- Конфигурация и глобальные переменные ---
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
