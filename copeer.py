@@ -31,7 +31,7 @@ from collections import defaultdict
 console = Console()
 
 # --- ИЗМЕНЕНИЕ: ВЕРСИЯ ---
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 # --- Конфигурация и глобальные переменные ---
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
@@ -372,53 +372,49 @@ def archive_sequence_to_destination(job, dest_tar_path):
         return False
 
 # Замените эту функцию целиком
-# Замените эту функцию целиком
-# Замените эту функцию целиком
 def process_job_worker(job, config, disk_manager):
-    """Обрабатывает одно задание, используя source_root и destination_root для построения путей."""
+    """Обрабатывает одно задание, обновляя статус до начала тяжелой операции."""
     thread_id, start_time = get_ident(), time.monotonic()
     is_dry_run = config['dry_run']
+
+    # --- ИЗМЕНЕНИЕ: Устанавливаем статус немедленно ---
+    short_name = job.get('tar_filename') or os.path.basename(job['key'])
+    status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
+    worker_stats[thread_id]['status'] = status_text
+    worker_stats[thread_id]['speed'] = 0 # Сбрасываем скорость
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
         source_root = config.get('source_root')
         destination_root = config.get('destination_root', '/')
 
-        # job['key'] - это АБСОЛЮТНЫЙ путь к файлу или виртуальному архиву
         absolute_source_key = job['key']
 
-        # Вычисляем относительную часть пути, которую нужно воссоздать
-        if source_root:
+        if source_root and absolute_source_key.startswith(os.path.normpath(source_root) + os.sep):
             rel_path = os.path.relpath(absolute_source_key, source_root)
         else:
             rel_path = absolute_source_key.lstrip(os.path.sep)
 
-        # Строим финальный путь назначения
-        # os.path.join корректно обработает, если destination_root равен '/'
         dest_path = os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path)
         dest_path = os.path.normpath(dest_path)
 
         if job['type'] == 'sequence':
-            short_name = job['tar_filename']
-            worker_stats[thread_id]['status'] = f"[yellow]Архивирую:[/] {short_name}"
-
+            # Статус уже установлен
             if not is_dry_run:
                 for f in job['source_files']:
                     if not os.path.exists(f): raise FileNotFoundError(f"Исходный файл секвенции не найден: {f}")
                 if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
-            else: time.sleep(0.01)
-
+            else:
+                time.sleep(0.01)
             source_keys_to_log = job['source_files']
         else: # 'file'
-            short_name = os.path.basename(absolute_source_key)
-            worker_stats[thread_id]['status'] = f"[cyan]Копирую:[/] {short_name}"
-
+            # Статус уже установлен
             if not is_dry_run:
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                 subprocess.run(["rsync", "-a", "--checksum", absolute_source_key, dest_path], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            else: time.sleep(0.005)
-
+            else:
+                time.sleep(0.005)
             source_keys_to_log = [absolute_source_key]
 
         elapsed = time.monotonic() - start_time
@@ -429,7 +425,6 @@ def process_job_worker(job, config, disk_manager):
 
     except Exception as e:
         log.error(f"Ошибка при обработке {job['key']}: {e}")
-        short_name = os.path.basename(job['key'])
         worker_stats[thread_id]['status'] = f"[red]Ошибка:[/] {short_name}"
         worker_stats[thread_id]['speed'] = -1
         with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
@@ -578,6 +573,8 @@ def main(args):
     state_log = config['state_file']
     mapping_log = config['dry_run_mapping_file'] if is_dry_run else config['mapping_file']
 
+# В функции main найдите блок try... with Live(...) и замените его целиком
+
     try:
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
@@ -587,36 +584,43 @@ def main(args):
 
                 future_to_job = {executor.submit(process_job_worker, job, config, disk_manager): job for job in jobs_to_process}
 
-                for future in as_completed(future_to_job):
-                    # --- ИЗМЕНЕНИЕ: Обрабатываем результат от воркера ---
-                    source_keys, dest_path, size_processed, job_type = future.result()
+                # --- ИЗМЕНЕНИЕ: Добавляем timeout для отзывчивости интерфейса ---
+                futures = as_completed(future_to_job, timeout=0.5)
 
-                    if source_keys is not None:
-                        # Логируем каждый исходный ключ с общим путем назначения
-                        for key in source_keys:
-                            write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
+                while jobs_completed_count < len(jobs_to_process):
+                    try:
+                        future = next(futures)
+                        source_keys, dest_path, size_processed, job_type = future.result()
 
-                        # Обновляем статистику для TUI
-                        if job_type == 'sequence':
-                            completed_stats['sequence']['count'] += 1
-                            completed_stats['sequence']['size'] += size_processed
-                        else: # 'file'
-                            completed_stats['files']['count'] += 1
-                            completed_stats['files']['size'] += size_processed
-                    else:
-                        all_jobs_successful = False
+                        if source_keys is not None:
+                            for key in source_keys:
+                                write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
 
-                    jobs_completed_count += 1
-                    progress.update(main_task, advance=1)
-                    job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+                            if job_type == 'sequence':
+                                completed_stats['sequence']['count'] += 1
+                                completed_stats['sequence']['size'] += size_processed
+                            else:
+                                completed_stats['files']['count'] += 1
+                                completed_stats['files']['size'] += size_processed
+                        else:
+                            all_jobs_successful = False
 
+                        jobs_completed_count += 1
+                        progress.update(main_task, advance=1)
+                        job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+
+                    except TimeoutError:
+                        # Эта ошибка ожидаема, она возникает, если за 0.5с ни один поток не завершился
+                        # Мы просто используем эту паузу для обновления TUI
+                        pass
+
+                    # Обновляем TUI в каждой итерации цикла
                     layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
                     if not is_dry_run:
                         layout["disks"].update(generate_disks_panel(disk_manager, config))
                     layout["middle"].update(generate_workers_panel(config['threads']))
 
-    except (Exception, KeyboardInterrupt):
-        console.print_exception(show_locals=False)
+    except (KeyboardInterrupt, SystemExit):
         console.print("\n[bold red]Процесс прерван. В реальном режиме состояние сохранено.[/bold red]")
         sys.exit(1)
 
