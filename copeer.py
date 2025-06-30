@@ -372,9 +372,11 @@ def archive_sequence_to_destination(job, dest_tar_path):
         return False
 
 # Замените эту функцию целиком
+# Замените эту функцию целиком
 def process_job_worker(job, config, disk_manager):
     """
-    Обрабатывает одно задание, считывая прогресс от rsync в реальном времени.
+    Обрабатывает одно задание, считывая прогресс от rsync в реальном времени,
+    используя флаг для отключения буферизации.
     """
     thread_id, start_time = get_ident(), time.monotonic()
     is_dry_run = config['dry_run']
@@ -382,7 +384,6 @@ def process_job_worker(job, config, disk_manager):
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
 
-    # Сразу устанавливаем базовый статус
     worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0}
 
     try:
@@ -399,7 +400,6 @@ def process_job_worker(job, config, disk_manager):
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
 
         if job['type'] == 'sequence':
-            # Для tar прогресс показать сложно, оставляем как есть, но это быстро
             if not is_dry_run:
                 for f in job['source_files']:
                     if not os.path.exists(f): raise FileNotFoundError(f"Исходный файл секвенции не найден: {f}")
@@ -413,12 +413,11 @@ def process_job_worker(job, config, disk_manager):
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                # --- ИЗМЕНЕНИЕ: Запускаем rsync через Popen и читаем stdout ---
-                rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", absolute_source_key, dest_path]
+                # --- ИЗМЕНЕНИЕ: Добавляем флаг --outbuf=L ---
+                rsync_cmd = ["rsync", "-a", "--checksum", "--outbuf=L", "--info=progress2", absolute_source_key, dest_path]
+
                 process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
 
-                # Парсим вывод rsync для получения прогресса
-                # Пример строки:  1,468,006,400  43%   54.96MB/s    0:00:46 (xfr#1, to-chk=0/1)
                 progress_re = re.compile(r'\s*[\d,]+\s+(\d+)%\s+([\d.]+\w+/s)')
 
                 for line in iter(process.stdout.readline, ''):
@@ -428,18 +427,16 @@ def process_job_worker(job, config, disk_manager):
                         worker_stats[thread_id]['progress'] = int(percent)
                         worker_stats[thread_id]['speed'] = speed
 
-                process.wait() # Ждем завершения процесса
+                process.wait()
                 if process.returncode != 0:
                     stderr_output = process.stderr.read()
                     raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=stderr_output)
             else:
-                # В dry-run имитируем прогресс
                 for p in range(0, 101, 20):
                     worker_stats[thread_id]['progress'] = p
                     worker_stats[thread_id]['speed'] = "DRY RUN"
                     time.sleep(0.01)
 
-        # Очищаем статус после завершения
         worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
         return source_keys_to_log, dest_path, job['size'], job['type']
 
