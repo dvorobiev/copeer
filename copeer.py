@@ -23,6 +23,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.logging import RichHandler
 from rich.filesize import decimal
+from rich.prompt import Prompt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, get_ident
 from collections import defaultdict
@@ -176,68 +177,183 @@ def find_sequences(dirs, config):
 
 # --- ИЗМЕНЕНО: Функция теперь возвращает детальную сводку для TUI ---
 # Замените эту функцию целиком
+# Замените эту функцию целиком
+# Замените эту функцию целиком
+# Замените эту функцию целиком
+# Убедитесь, что этого импорта НЕТ в начале файла, он нам больше не нужен для этой функции
+# from rich.progress import Progress
+
+# ...
+
+# Замените эту функцию целиком
+# Убедитесь, что эти импорты есть в начале файла
+from rich.live import Live
+from rich.text import Text
+
+# Замените эту функцию целиком
+# Замените эту функцию целиком
+# Замените эту функцию целиком
 def analyze_and_plan_jobs(input_csv_path, config):
-    """Анализирует CSV, формирует план работ с абсолютными путями к источникам."""
+    """
+    Анализирует CSV, используя двухступенчатый парсер для максимального
+    охвата различных форматов строк.
+    """
     console.rule("[yellow]Шаг 1: Анализ и планирование[/]")
     console.print(f"Анализ файла: [bold cyan]{input_csv_path}[/bold cyan]")
 
-    line_parser = re.compile(r'^"(.*?)","(.*?)",.*,"(\d+)"$')
-    dirs, all_files_from_csv = defaultdict(list), {}
+    # --- ИЗМЕНЕНИЕ: Двухступенчатая иерархия парсеров ---
+    # 1. Основной парсер для строк формата "path","type",...
+    parser_primary = re.compile(r'^"([^"]+)","([^"]+)",.*')
+    # 2. Запасной парсер для строк формата "path",regular f,...
+    #    Он захватывает только путь, если это похоже на файл (есть расширение)
+    parser_fallback = re.compile(r'^"([^"]+\.\w{2,5})",.*', re.IGNORECASE)
 
+
+    dirs, all_files_from_csv = defaultdict(list), {}
     source_root = config.get('source_root')
     if source_root:
         console.print(f"Используется корень источника: [cyan]{source_root}[/cyan]")
-    else:
-        console.print("[bold yellow]Внимание: `source_root` не задан в конфиге. Пути из CSV будут считаться абсолютными.[/bold yellow]")
+
+    lines_total = 0
+    lines_ignored_dirs = 0
+    malformed_lines = []
 
     try:
+        # Быстрый подсчет строк для прогресс-бара
         with open(input_csv_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for i, line in enumerate(f):
-                line = line.strip()
-                if not line: continue
-                match = line_parser.match(line)
-                if not match: continue
+            total_lines_for_progress = sum(1 for _ in f)
 
-                rel_path, file_type, size_str = match.groups()
-                if 'regular file' not in file_type: continue
+        with Progress(console=console) as progress:
+            task = progress.add_task("[green]Анализ CSV...", total=total_lines_for_progress)
 
-                try: size = int(size_str)
-                except ValueError: continue
+            with open(input_csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    progress.update(task, advance=1)
+                    lines_total += 1
 
-                # --- ИЗМЕНЕНИЕ: Создаем АБСОЛЮТНЫЙ путь к исходнику ---
-                # Этот абсолютный путь будет уникальным ключом для файла/секции
-                absolute_source_path = os.path.join(source_root, rel_path) if source_root else rel_path
-                absolute_source_path = os.path.normpath(absolute_source_path)
+                    cleaned_line = line.strip().replace('""', '"')
+                    if not cleaned_line:
+                        malformed_lines.append((lines_total, line, "Пустая строка"))
+                        continue
 
-                path_obj = Path(absolute_source_path)
-                parent_dir = str(path_obj.parent)
-                filename = path_obj.name
+                    rel_path, file_type, size = None, "", 0
 
-                dirs[parent_dir].append((filename, size))
-                all_files_from_csv[absolute_source_path] = size
+                    # --- ИЗМЕНЕНИЕ: Пробуем парсеры по очереди ---
+                    match = parser_primary.match(cleaned_line)
+                    if match:
+                        # Основной парсер сработал
+                        rel_path, file_type = match.groups()
+                    else:
+                        match = parser_fallback.match(cleaned_line)
+                        if match:
+                            # Запасной парсер сработал
+                            rel_path = match.group(1)
+                            file_type = "file" # Мы предполагаем, что это файл
 
+                    if rel_path:
+                        # Если удалось извлечь путь, анализируем его
+                        if 'directory' in file_type:
+                            lines_ignored_dirs += 1
+                            continue
+
+                        # Если это не директория, считаем файлом
+                        size_match = re.search(r',"(\d+)"$', cleaned_line)
+                        if size_match:
+                            try: size = int(size_match.group(1))
+                            except (ValueError, IndexError): size = 0
+
+                        absolute_source_path = os.path.join(source_root, rel_path) if source_root else rel_path
+                        absolute_source_path = os.path.normpath(absolute_source_path)
+
+                        path_obj = Path(absolute_source_path)
+                        dirs[str(path_obj.parent)].append((path_obj.name, size))
+                        all_files_from_csv[absolute_source_path] = size
+                    else:
+                        # Если ни один парсер не сработал
+                        malformed_lines.append((lines_total, line, "Неизвестный формат строки"))
+
+    except (KeyboardInterrupt, SystemExit):
+        console.print("\n[yellow]Анализ прерван пользователем.[/yellow]")
+        sys.exit(0)
     except FileNotFoundError: console.print(f"[bold red]Критическая ошибка: CSV-файл не найден: {input_csv_path}[/]"); sys.exit(1)
     except Exception as e: console.print(f"[bold red]Критическая ошибка при чтении CSV: {e}[/]"); sys.exit(1)
 
+    # ... остальная часть функции (вывод отчета, меню) остается без изменений ...
     if not all_files_from_csv:
-        log.warning("В CSV не найдено ни одного файла для обработки. Завершение.")
+        if malformed_lines:
+            console.print("\n[bold red]Не найдено ни одного корректного файла для обработки. Обнаружены следующие проблемы:[/bold red]")
+            for num, err_line, reason in malformed_lines[:50]:
+                console.print(f"[dim]Строка #{num} ({reason}):[/dim] {err_line}")
+        else:
+            log.warning("В CSV не найдено ни одного файла для обработки.")
         sys.exit(0)
 
     sequences, sequence_files = find_sequences(dirs, config)
     standalone_files = set(all_files_from_csv.keys()) - sequence_files
 
     jobs = sequences + [{'type': 'file', 'key': f, 'size': all_files_from_csv[f]} for f in standalone_files]
+    skipped_from_state = len(jobs) - len([job for job in jobs if job['key'] not in processed_items_keys])
     jobs_to_process = [job for job in jobs if job['key'] not in processed_items_keys]
+
+    if not jobs_to_process:
+        log.info("[bold green]✅ Все задания из входного файла уже выполнены. Завершение.[/bold green]")
+        return [], None
+
     jobs_to_process.sort(key=lambda j: j.get('size', 0), reverse=True)
 
     seq_jobs = [j for j in jobs_to_process if j['type'] == 'sequence']
     file_jobs = [j for j in jobs_to_process if j['type'] == 'file']
 
+    while True:
+        console.clear()
+        console.rule("[yellow]Отчет по анализу[/]")
+        report_table = Table(title=None, show_header=False, box=None, padding=(0, 2))
+        report_table.add_column("Параметр", style="cyan", no_wrap=True)
+        report_table.add_column("Значение", style="white", justify="right")
+
+        report_table.add_row("Всего строк в CSV файле:", f"{lines_total:,}")
+        report_table.add_row("  Пропущено (директории):", f"[dim]{lines_ignored_dirs:,}[/dim]")
+
+        malformed_count = len(malformed_lines)
+        malformed_style = "red" if malformed_count > 0 else "dim"
+        report_table.add_row(f"  Пропущено (неопознанный формат):", f"[{malformed_style}]{malformed_count:,}[/{malformed_style}]")
+
+        report_table.add_row("[bold]Найдено файлов для обработки:", f"[bold green]{len(all_files_from_csv):,}[/bold green]")
+        report_table.add_section()
+        report_table.add_row("Из них сгруппировано в секвенции:", f"{len(sequence_files):,}")
+        report_table.add_row("  Что соответствует заданиям на архивацию:", f"[yellow]{len(sequences):,}[/yellow]")
+        report_table.add_row("Осталось отдельных файлов для копирования:", f"{len(standalone_files):,}")
+        report_table.add_section()
+        report_table.add_row("Всего заданий до возобновления:", f"{len(jobs):,}")
+        report_table.add_row("  Пропущено (уже выполнены):", f"[dim]{skipped_from_state:,}[/dim]")
+        report_table.add_row("[bold]Всего заданий к выполнению:", f"[bold bright_magenta]{len(jobs_to_process):,}[/bold bright_magenta]")
+
+        console.print(report_table)
+
+        choices = ["s", "q"]
+        prompt_text = "\n[bold]Выберите действие: ([green]S[/green])тарт / ([red]Q[/red])uit"
+        if malformed_count > 0:
+            choices.append("e")
+            prompt_text += " / ([yellow]E[/yellow])rrors"
+
+        choice = Prompt.ask(prompt_text, choices=choices, default="s").lower()
+
+        if choice == 's':
+            break
+        elif choice == 'q':
+            console.print("[yellow]Выполнение отменено пользователем.[/yellow]")
+            sys.exit(0)
+        elif choice == 'e' and malformed_count > 0:
+            console.print("\n[bold yellow]----- Список некорректных строк (первые 50) -----[/bold yellow]")
+            for num, line, reason in malformed_lines[:50]:
+                console.print(f"[dim]Строка #{num} ({reason}):[/dim] {line}")
+            console.input("\n[bold]Нажмите [green]Enter[/green] для возврата в меню...[/bold]")
+
     plan_summary = {
         "sequences": {"count": len(seq_jobs), "size": sum(j['size'] for j in seq_jobs)},
         "files": {"count": len(file_jobs), "size": sum(j['size'] for j in file_jobs)},
         "total": {"count": len(jobs_to_process), "size": sum(j['size'] for j in jobs_to_process)},
-        "skipped": len(jobs) - len(jobs_to_process)
+        "skipped": skipped_from_state
     }
 
     return jobs_to_process, plan_summary
