@@ -31,7 +31,7 @@ from collections import defaultdict
 console = Console()
 
 # --- ИЗМЕНЕНИЕ: ВЕРСИЯ ---
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 # --- Конфигурация и глобальные переменные ---
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
@@ -373,21 +373,22 @@ def archive_sequence_to_destination(job, dest_tar_path):
 
 # Замените эту функцию целиком
 def process_job_worker(job, config, disk_manager):
-    """Обрабатывает одно задание, обновляя статус до начала тяжелой операции."""
+    """
+    Обрабатывает одно задание, считывая прогресс от rsync в реальном времени.
+    """
     thread_id, start_time = get_ident(), time.monotonic()
     is_dry_run = config['dry_run']
 
-    # --- ИЗМЕНЕНИЕ: Устанавливаем статус немедленно ---
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
-    worker_stats[thread_id]['status'] = status_text
-    worker_stats[thread_id]['speed'] = 0 # Сбрасываем скорость
+
+    # Сразу устанавливаем базовый статус
+    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0}
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
         source_root = config.get('source_root')
         destination_root = config.get('destination_root', '/')
-
         absolute_source_key = job['key']
 
         if source_root and absolute_source_key.startswith(os.path.normpath(source_root) + os.sep):
@@ -395,42 +396,58 @@ def process_job_worker(job, config, disk_manager):
         else:
             rel_path = absolute_source_key.lstrip(os.path.sep)
 
-        dest_path = os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path)
-        dest_path = os.path.normpath(dest_path)
+        dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
 
         if job['type'] == 'sequence':
-            # Статус уже установлен
+            # Для tar прогресс показать сложно, оставляем как есть, но это быстро
             if not is_dry_run:
                 for f in job['source_files']:
                     if not os.path.exists(f): raise FileNotFoundError(f"Исходный файл секвенции не найден: {f}")
                 if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
-            else:
-                time.sleep(0.01)
+            else: time.sleep(0.01)
             source_keys_to_log = job['source_files']
+
         else: # 'file'
-            # Статус уже установлен
+            source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                subprocess.run(["rsync", "-a", "--checksum", absolute_source_key, dest_path], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            else:
-                time.sleep(0.005)
-            source_keys_to_log = [absolute_source_key]
 
-        elapsed = time.monotonic() - start_time
-        speed = job['size'] / elapsed if elapsed > 0 else 0
-        worker_stats[thread_id]['status'] = "[green]Свободен[/green]"
-        worker_stats[thread_id]['speed'] = speed
+                # --- ИЗМЕНЕНИЕ: Запускаем rsync через Popen и читаем stdout ---
+                rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", absolute_source_key, dest_path]
+                process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+
+                # Парсим вывод rsync для получения прогресса
+                # Пример строки:  1,468,006,400  43%   54.96MB/s    0:00:46 (xfr#1, to-chk=0/1)
+                progress_re = re.compile(r'\s*[\d,]+\s+(\d+)%\s+([\d.]+\w+/s)')
+
+                for line in iter(process.stdout.readline, ''):
+                    match = progress_re.search(line)
+                    if match:
+                        percent, speed = match.groups()
+                        worker_stats[thread_id]['progress'] = int(percent)
+                        worker_stats[thread_id]['speed'] = speed
+
+                process.wait() # Ждем завершения процесса
+                if process.returncode != 0:
+                    stderr_output = process.stderr.read()
+                    raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=stderr_output)
+            else:
+                # В dry-run имитируем прогресс
+                for p in range(0, 101, 20):
+                    worker_stats[thread_id]['progress'] = p
+                    worker_stats[thread_id]['speed'] = "DRY RUN"
+                    time.sleep(0.01)
+
+        # Очищаем статус после завершения
+        worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
         return source_keys_to_log, dest_path, job['size'], job['type']
 
     except Exception as e:
+        worker_stats[thread_id] = {"status": f"[red]Ошибка:[/] {short_name}", "speed": "ERROR", "progress": None}
         log.error(f"Ошибка при обработке {job['key']}: {e}")
-        worker_stats[thread_id]['status'] = f"[red]Ошибка:[/] {short_name}"
-        worker_stats[thread_id]['speed'] = -1
         with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
         return None, None, 0, job['type']
-
-# Замените эту функцию целиком
 
 
 
@@ -498,18 +515,40 @@ def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
         table.add_row(f"[bold]{mount}{is_active}[/bold]", bar, f"{percent:.1f}%")
     return Panel(table, title="📦 Диски", border_style="blue")
 
+# Замените эту функцию целиком
 def generate_workers_panel(threads) -> Panel:
-    table = Table(expand=True)
+    """Генерирует панель потоков с индивидуальными прогресс-барами."""
+    table = Table.grid(expand=True)
     table.add_column("Поток", justify="center", style="cyan", width=12)
     table.add_column("Статус", style="white", no_wrap=True, ratio=2)
     table.add_column("Скорость", justify="right", style="magenta", width=15)
+
     sorted_workers = sorted(worker_stats.keys())
+
     for tid in sorted_workers:
-        stats, speed_str = worker_stats[tid], ""
-        if stats['speed'] > 0: speed_str = f"{decimal(stats['speed'])}/s"
-        elif stats['speed'] == -1: speed_str = "[red]ERROR[/red]"
-        else: speed_str = "[dim]---[/dim]"
-        table.add_row(str(tid), stats['status'], speed_str)
+        stats = worker_stats.get(tid)
+        if not stats: continue
+
+        status_renderable = stats.get("status", "[grey50]Ожидание...[/grey50]")
+        speed_str = stats.get("speed", "[dim]---[/dim]")
+        progress_val = stats.get("progress")
+
+        if progress_val is not None and 0 <= progress_val <= 100:
+            # Если есть прогресс, рисуем мини-прогресс-бар
+            p_bar = Progress(BarColumn(bar_width=None), TextColumn("{task.percentage:>3.0f}%"), expand=True)
+            task_id = p_bar.add_task("p", total=100)
+            p_bar.update(task_id, completed=progress_val)
+
+            # Создаем вложенную таблицу для красивого отображения
+            status_grid = Table.grid(expand=True)
+            status_grid.add_row(status_renderable)
+            status_grid.add_row(p_bar)
+
+            table.add_row(str(tid), status_grid, speed_str)
+        else:
+            # Если прогресса нет, рисуем как раньше
+            table.add_row(str(tid), status_renderable, speed_str)
+
     return Panel(table, title=f"👷 Потоки ({threads})", border_style="green")
 
 # --- ИЗМЕНЕНО: Главная функция теперь управляет обновленным TUI ---
