@@ -466,12 +466,13 @@ def generate_workers_panel(threads) -> Panel:
 
 # --- Точка входа ---
 
+# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Smart Archiver & Copier v{__version__}[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Smart Archiver & Copier v3.0.1[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -504,19 +505,29 @@ def main(args):
     console.rule("[yellow]Шаг 2: Выполнение[/]")
     time.sleep(1)
 
-    job_counter_column = TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]")
-    progress = Progress(TextColumn("[bold blue]Общий прогресс:[/bold blue]"), BarColumn(), TaskProgressColumn(), TextColumn("•"),
-                        job_counter_column, TextColumn("•"), TransferSpeedColumn(), TextColumn("•"), TimeRemainingColumn())
-    main_task = progress.add_task("выполнение", total=plan_summary['total']['count'])
+    # --- ИЗМЕНЕНИЕ: Собираем ВЕСЬ интерфейс ДО запуска Live ---
     layout = make_layout()
-    layout["bottom"].update(Panel(progress, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
 
+    # Создаем все компоненты
     completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
     jobs_completed_count, all_jobs_successful = 0, True
 
+    job_counter_column = TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]")
+    progress_bar = Progress(TextColumn("[bold blue]Общий прогресс:[/bold blue]"), BarColumn(), TaskProgressColumn(), TextColumn("•"),
+                            job_counter_column, TextColumn("•"), TransferSpeedColumn(), TextColumn("•"), TimeRemainingColumn())
+    main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['count'])
+
+    # Заполняем все слои layout'а
+    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+    layout["disks"].update(generate_disks_panel(disk_manager, config))
+    layout["middle"].update(generate_workers_panel(config['threads']))
+    layout["bottom"].update(Panel(progress_bar, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
+
     try:
+        # Теперь передаем в Live полностью готовый layout
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
+
                 future_to_job = {executor.submit(process_job_worker, job, config, disk_manager): job for job in jobs_to_process}
 
                 for future in as_completed(future_to_job):
@@ -536,10 +547,10 @@ def main(args):
                         all_jobs_successful = False
 
                     jobs_completed_count += 1
-                    progress.update(main_task, advance=1)
+                    progress_bar.update(main_task, advance=1)
                     job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
 
-                    # Обновляем панели после обработки результата
+                    # В цикле мы только ОБНОВЛЯЕМ панели, а не создаем их
                     layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
                     if not is_dry_run:
                         layout["disks"].update(generate_disks_panel(disk_manager, config))
@@ -549,7 +560,7 @@ def main(args):
         console.print("\n[bold red]Процесс прерван. В реальном режиме состояние сохранено.[/bold red]")
         sys.exit(1)
 
-    if all_jobs_successful and progress.finished:
+    if all_jobs_successful and progress_bar.finished:
         console.rule("[bold green]✅ Все задания успешно выполнены[/bold green]")
     else:
         console.rule("[bold yellow]Выполнение завершено, но были ошибки. Проверьте лог.[/bold yellow]")
