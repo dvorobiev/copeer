@@ -42,7 +42,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "3.0.0"  # Финальная стабильная версия
+__version__ = "3.1.0"  # Добавлена статистика по скорости
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
     'mount_points': ["/mnt/disk1", "/mnt/disk2"],
@@ -57,7 +57,7 @@ DEFAULT_CONFIG = {
     'threads': 8,
     'min_files_for_sequence': 50,
     'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
-    'progress_mode': 'advanced' if UNIX_SYSTEM else 'simple' # 'simple' или 'advanced'
+    'progress_mode': 'advanced' if UNIX_SYSTEM else 'simple'
 }
 SEQUENCE_RE = re.compile(r'^(.*?)[\._]*(\d+)\.([a-zA-Z0-9]+)$', re.IGNORECASE)
 
@@ -71,7 +71,7 @@ worker_stats = defaultdict(lambda: {"status": "[grey50]Ожидание...[/grey
 # --- Основные классы ---
 
 class DiskManager:
-    """Управляет выбором диска для записи, чтобы не превышать порог заполнения."""
+    """Управляет выбором диска для записи."""
     def __init__(self, mount_points, threshold):
         self.mount_points = mount_points
         self.threshold = threshold
@@ -98,6 +98,7 @@ class DiskManager:
                 log.info(f"Выбран начальный диск: [bold green]{self.active_disk}[/bold green]")
                 return
         log.error("🛑 Не найдено подходящих дисков для начала работы.")
+        raise RuntimeError("Не найдено подходящих дисков")
 
     def get_current_destination(self):
         with self.lock:
@@ -121,12 +122,11 @@ class DiskManager:
 # --- Вспомогательные функции ---
 
 def load_config():
-    """Загружает конфигурацию из YAML файла или создает его по умолчанию."""
     config = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f: config.update(yaml.safe_load(f) or {})
-        except Exception as e: console.print(f"[bold red]Ошибка чтения {CONFIG_FILE}: {e}. Использованы значения по умолчанию.[/bold red]")
+        except Exception as e: console.print(f"[bold red]Ошибка чтения {CONFIG_FILE}: {e}.[/bold red]")
     else:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f: yaml.dump(DEFAULT_CONFIG, f, sort_keys=False, allow_unicode=True)
         log.info(f"Создан файл конфигурации по умолчанию: [cyan]{CONFIG_FILE}[/cyan]")
@@ -134,7 +134,6 @@ def load_config():
     return config
 
 def load_previous_state(state_file, processed_items_keys):
-    """Загружает ключи уже обработанных элементов для возобновления работы."""
     if os.path.exists(state_file):
         try:
             with open(state_file, 'r', encoding='utf-8') as f:
@@ -144,7 +143,6 @@ def load_previous_state(state_file, processed_items_keys):
         except Exception as e: log.error(f"Не удалось прочитать файл состояния {state_file}: {e}")
 
 def write_log(state_log_file, mapping_log_file, key, dest_path=None, is_dry_run=False):
-    """Записывает информацию в state и mapping файлы."""
     with file_lock:
         if not is_dry_run:
             with open(state_log_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key])
@@ -152,7 +150,6 @@ def write_log(state_log_file, mapping_log_file, key, dest_path=None, is_dry_run=
             with open(mapping_log_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key, dest_path])
 
 def find_sequences(dirs, config):
-    """Находит все последовательности в сгруппированных по каталогам файлах."""
     all_sequences, sequence_files = [], set()
     for dir_path, files_with_sizes in dirs.items():
         sequences_in_dir = defaultdict(list)
@@ -160,8 +157,7 @@ def find_sequences(dirs, config):
             match = SEQUENCE_RE.match(filename)
             if match and match.group(3).lower() in config.get('image_extensions', set()):
                 prefix, frame, ext = match.groups()
-                full_path = os.path.join(dir_path, filename)
-                sequences_in_dir[(prefix, ext.lower())].append((int(frame), full_path, file_size))
+                sequences_in_dir[(prefix, ext.lower())].append((int(frame), os.path.join(dir_path, filename), file_size))
         for (prefix, ext), file_tuples in sequences_in_dir.items():
             if len(file_tuples) >= config.get('min_files_for_sequence', 50):
                 file_tuples.sort()
@@ -175,26 +171,15 @@ def find_sequences(dirs, config):
     return all_sequences, sequence_files
 
 def archive_sequence_to_destination(job, dest_tar_path):
-    """Создает tar-архив из файлов секвенции непосредственно в целевом каталоге."""
-    try:
-        os.makedirs(os.path.dirname(dest_tar_path), exist_ok=True)
-        with tarfile.open(dest_tar_path, "w") as tar:
-            for file_path in job['source_files']:
-                if os.path.exists(file_path): tar.add(file_path, arcname=os.path.basename(file_path))
-                else: log.warning(f"В секвенции не найден файл: {file_path}")
-        return True
-    except Exception as e:
-        log.error(f"✖ Ошибка при создании архива {dest_tar_path}: {e}")
-        if os.path.exists(dest_tar_path): os.remove(dest_tar_path)
-        return False
-
+    os.makedirs(os.path.dirname(dest_tar_path), exist_ok=True)
+    with tarfile.open(dest_tar_path, "w") as tar:
+        for file_path in job['source_files']:
+            if os.path.exists(file_path): tar.add(file_path, arcname=os.path.basename(file_path))
+            else: log.warning(f"В секвенции не найден файл: {file_path}")
 
 # --- Логика анализа и выполнения ---
 
 def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
-    """
-    Анализирует CSV, используя иерархию парсеров, выводит отчет и ждет подтверждения.
-    """
     console.rule("[yellow]Шаг 1: Анализ и планирование[/]")
     console.print(f"Анализ файла: [bold cyan]{input_csv_path}[/bold cyan]")
 
@@ -219,8 +204,7 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
                     lines_total += 1
                     cleaned_line = line.strip().replace('""', '"')
                     if not cleaned_line:
-                        malformed_lines.append((lines_total, line, "Пустая строка"))
-                        continue
+                        malformed_lines.append((lines_total, line, "Пустая строка")); continue
 
                     rel_path, file_type, size = None, "", 0
                     match = parser_primary.match(cleaned_line)
@@ -228,13 +212,11 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
                         rel_path, file_type = match.groups()
                     else:
                         match = parser_fallback.match(cleaned_line)
-                        if match:
-                            rel_path, file_type = match.group(1), "file"
+                        if match: rel_path, file_type = match.group(1), "file"
 
                     if rel_path:
                         if 'directory' in file_type:
-                            lines_ignored_dirs += 1
-                            continue
+                            lines_ignored_dirs += 1; continue
 
                         size_match = re.search(r',"(\d+)"$', cleaned_line)
                         if size_match:
@@ -254,7 +236,7 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
 
     if not all_files_from_csv:
         if malformed_lines:
-            console.print("\n[bold red]Не найдено ни одного корректного файла. Обнаружены следующие проблемы:[/bold red]")
+            console.print("\n[bold red]Не найдено корректных файлов. Обнаружены проблемы:[/bold red]")
             for num, err_line, reason in malformed_lines[:50]: console.print(f"[dim]Строка #{num} ({reason}):[/dim] {err_line}")
         else: log.warning("В CSV не найдено ни одного файла для обработки.")
         sys.exit(0)
@@ -321,7 +303,6 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
 
 
 def process_job_worker(job, config, disk_manager):
-    """Обрабатывает одно задание, используя надежный подход для TUI."""
     thread_id = get_ident()
     progress_mode = config.get('progress_mode', 'simple')
     is_dry_run = config['dry_run']
@@ -329,7 +310,7 @@ def process_job_worker(job, config, disk_manager):
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
 
-    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0 if progress_mode == 'advanced' else None}
+    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0 if progress_mode == 'advanced' and not is_dry_run else None}
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
@@ -345,8 +326,7 @@ def process_job_worker(job, config, disk_manager):
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
 
         if job['type'] == 'sequence':
-            if not is_dry_run:
-                if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
+            if not is_dry_run: archive_sequence_to_destination(job, dest_path)
             else: time.sleep(0.01)
             source_keys_to_log = job['source_files']
         else: # 'file'
@@ -357,10 +337,7 @@ def process_job_worker(job, config, disk_manager):
 
                 if progress_mode == 'advanced' and UNIX_SYSTEM:
                     rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
-                    process = subprocess.Popen(
-                        rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, bufsize=1, universal_newlines=True, encoding='utf-8', errors='replace'
-                    )
+                    process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True, encoding='utf-8', errors='replace')
                     fd = process.stdout.fileno()
                     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
                     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -371,12 +348,9 @@ def process_job_worker(job, config, disk_manager):
                             if chunk:
                                 last_update = chunk.strip().split('\r')[-1]
                                 match = progress_re.search(last_update)
-                                if match:
-                                    percent, speed = match.groups()
-                                    worker_stats[thread_id]['progress'] = int(percent)
-                                    worker_stats[thread_id]['speed'] = speed
+                                if match: worker_stats[thread_id]['progress'], worker_stats[thread_id]['speed'] = int(match.group(1)), match.group(2)
                         except (IOError, TypeError): time.sleep(0.1)
-                    if process.returncode != 0 and process.returncode != 20:
+                    if process.wait() != 0 and process.returncode != 20:
                         raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
                 else: # 'simple' mode
                     rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
@@ -400,79 +374,68 @@ def process_job_worker(job, config, disk_manager):
 # --- Функции для отрисовки TUI ---
 
 def make_layout() -> Layout:
-    """Определяет структуру TUI."""
     layout = Layout(name="root")
     layout.split_column(Layout(name="top", size=5), Layout(name="middle"), Layout(name="bottom", size=3))
     layout["top"].split_row(Layout(name="summary"), Layout(name="disks"))
     return layout
 
 def generate_summary_panel(plan, completed) -> Panel:
-    """Генерирует панель сводки с динамическим прогрессом."""
     table = Table(box=None, expand=True)
     table.add_column("Тип задания", style="cyan", no_wrap=True)
     table.add_column("Выполнено", style="green", justify="right")
     table.add_column("Размер", style="green", justify="right")
 
-    s_done, s_total = completed['sequence']['count'], plan['sequences']['count']
-    s_size_done, s_size_total = completed['sequence']['size'], plan['sequences']['size']
+    s_done, s_total, s_size_done, s_size_total = completed['sequence']['count'], plan['sequences']['count'], completed['sequence']['size'], plan['sequences']['size']
     table.add_row("Архивация", f"{s_done} / {s_total}", f"{decimal(s_size_done)} / {decimal(s_size_total)}")
 
-    f_done, f_total = completed['files']['count'], plan['files']['count']
-    f_size_done, f_size_total = completed['files']['size'], plan['files']['size']
+    f_done, f_total, f_size_done, f_size_total = completed['files']['count'], plan['files']['count'], completed['files']['size'], plan['files']['size']
     table.add_row("Копирование", f"{f_done} / {f_total}", f"{decimal(f_size_done)} / {decimal(f_size_total)}")
 
     table.add_row("[bold]Всего[/bold]", f"[bold]{s_done + f_done} / {s_total + f_total}[/bold]", f"[bold]{decimal(s_size_done + f_size_done)} / {decimal(s_size_total + f_size_total)}[/bold]")
     return Panel(table, title="📊 План выполнения", border_style="yellow")
 
 def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
-    """Генерирует панель со статусом дисков."""
     table = Table(box=None, expand=True)
     table.add_column("Диск", style="white", no_wrap=True)
     table.add_column("Заполнено", style="green", ratio=1)
     table.add_column("%", style="bold", justify="right")
     for mount, percent in disk_manager.get_all_disks_status():
         color = "green" if percent < config['threshold'] else "red"
-        bar = Progress(BarColumn(bar_width=None, style=color, complete_style=color), expand=True)
-        task_id = bar.add_task("d", total=100, completed=percent)
+        bar = Progress(BarColumn(bar_width=None), style=color, complete_style=color)
+        bar.add_task("d", total=100, completed=percent)
         is_active = " (*)" if mount == disk_manager.active_disk else ""
         table.add_row(f"[bold]{mount}{is_active}[/bold]", bar, f"{percent:.1f}%")
     return Panel(table, title="📦 Диски", border_style="blue")
 
 def generate_workers_panel(threads) -> Panel:
-    """Генерирует панель потоков с индивидуальными прогресс-барами."""
-    table = Table.grid(expand=True)
+    table = Table.grid(expand=True, padding=(0, 1))
     table.add_column("Поток", justify="center", style="cyan", width=12)
-    table.add_column("Статус", style="white", no_wrap=True, ratio=2)
-    table.add_column("Скорость", justify="right", style="magenta", width=15)
+    table.add_column("Статус", style="white", no_wrap=True)
 
     for tid in sorted(worker_stats.keys()):
         stats = worker_stats.get(tid, {})
-        status_renderable = stats.get("status", "[grey50]Ожидание...[/grey50]")
-        speed_str = stats.get("speed", "[dim]---[/dim]")
+        status = stats.get("status", "[grey50]Ожидание...[/grey50]")
         progress_val = stats.get("progress")
 
         if progress_val is not None and 0 <= progress_val <= 100:
-            p_bar = Progress(BarColumn(bar_width=None), TextColumn("{task.percentage:>3.0f}%"), expand=True)
+            p_bar = Progress(BarColumn(bar_width=None), TextColumn("{task.percentage:>3.0f}%"))
             p_bar.add_task("p", total=100, completed=progress_val)
-            status_grid = Table.grid(expand=True)
-            status_grid.add_row(status_renderable)
-            status_grid.add_row(p_bar)
-            table.add_row(str(tid), status_grid, speed_str)
+            status_grid = Table.grid(expand=True); status_grid.add_row(status); status_grid.add_row(p_bar)
+            table.add_row(str(tid), status_grid)
         else:
-            table.add_row(str(tid), status_renderable, speed_str)
+            table.add_row(str(tid), status)
 
     return Panel(table, title=f"👷 Потоки ({threads})", border_style="green")
 
 
 # --- Точка входа ---
 
-# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Smart Archiver & Copier v3.0.1[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Copeer v{__version__}[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -481,7 +444,7 @@ def main(args):
             with open(dry_run_log_path, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(["source_path", "destination_path"])
             console.print(f"Отчет dry-run будет сохранен в: [cyan]{dry_run_log_path}[/cyan]")
-        except IOError as e: console.print(f"[bold red]Не удалось создать файл отчета для dry-run: {e}[/bold red]")
+        except IOError as e: console.print(f"[bold red]Не удалось создать файл отчета: {e}[/bold red]")
 
     processed_items_keys = set()
     load_previous_state(config['state_file'], processed_items_keys)
@@ -489,42 +452,26 @@ def main(args):
     jobs_to_process, plan_summary = analyze_and_plan_jobs(args.input_file, config, processed_items_keys)
     if not jobs_to_process: return
 
-    if not is_dry_run:
-        disk_manager = DiskManager(config['mount_points'], config['threshold'])
-        if not disk_manager.active_disk: return
-    else:
-        class FakeDiskManager:
-            def __init__(self, mount_points):
-                self.mount_points = mount_points
-                self.active_disk = mount_points[0] if mount_points else "/dry/run/dest"
-            def get_current_destination(self): return self.active_disk
-            def get_all_disks_status(self): return [(p, 0.0) for p in self.mount_points]
-        disk_manager = FakeDiskManager(config['mount_points'])
-        log.info("Dry-run: симуляция записи на диск.")
+    disk_manager = DiskManager(config['mount_points'], config['threshold']) if not is_dry_run else type('FakeDisk', (), {'get_current_destination': lambda: "/dry/run/dest", 'get_all_disks_status': lambda: [(p, 0.0) for p in config['mount_points']]})()
+    if not is_dry_run and not disk_manager.active_disk: return
 
     console.rule("[yellow]Шаг 2: Выполнение[/]")
     time.sleep(1)
 
-    # --- ИЗМЕНЕНИЕ: Собираем ВЕСЬ интерфейс ДО запуска Live ---
-    layout = make_layout()
-
-    # Создаем все компоненты
     completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
-    jobs_completed_count, all_jobs_successful = 0, True
+    jobs_completed_count, all_jobs_successful, total_bytes_processed = 0, True, 0
+    total_time_start = time.monotonic()
 
-    job_counter_column = TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]")
+    # Инициализация TUI
+    layout = make_layout()
+    speed_column = TransferSpeedColumn()
     progress_bar = Progress(TextColumn("[bold blue]Общий прогресс:[/bold blue]"), BarColumn(), TaskProgressColumn(), TextColumn("•"),
-                            job_counter_column, TextColumn("•"), TransferSpeedColumn(), TextColumn("•"), TimeRemainingColumn())
-    main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['count'])
-
-    # Заполняем все слои layout'а
-    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-    layout["disks"].update(generate_disks_panel(disk_manager, config))
-    layout["middle"].update(generate_workers_panel(config['threads']))
+                            TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]", "job_counter"), TextColumn("•"),
+                            speed_column, TextColumn("•"), TimeRemainingColumn())
+    main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['size'])
     layout["bottom"].update(Panel(progress_bar, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
 
     try:
-        # Теперь передаем в Live полностью готовый layout
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
 
@@ -534,48 +481,40 @@ def main(args):
                     job_type, size_processed, source_keys, dest_path = future.result()
 
                     if job_type:
-                        for key in source_keys:
-                            write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
-
+                        for key in source_keys: write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
                         if job_type == 'sequence':
-                            completed_stats['sequence']['count'] += 1
-                            completed_stats['sequence']['size'] += size_processed
+                            completed_stats['sequence']['count'] += 1; completed_stats['sequence']['size'] += size_processed
                         else:
-                            completed_stats['files']['count'] += 1
-                            completed_stats['files']['size'] += size_processed
+                            completed_stats['files']['count'] += 1; completed_stats['files']['size'] += size_processed
+                        total_bytes_processed += size_processed
                     else:
                         all_jobs_successful = False
 
                     jobs_completed_count += 1
-                    progress_bar.update(main_task, advance=1)
-                    job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+                    progress_bar.update(main_task, advance=size_processed)
+                    progress_bar.columns[4].text = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
 
-                    # В цикле мы только ОБНОВЛЯЕМ панели, а не создаем их
                     layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-                    if not is_dry_run:
-                        layout["disks"].update(generate_disks_panel(disk_manager, config))
+                    if not is_dry_run: layout["disks"].update(generate_disks_panel(disk_manager, config))
                     layout["middle"].update(generate_workers_panel(config['threads']))
 
     except (KeyboardInterrupt, SystemExit):
-        console.print("\n[bold red]Процесс прерван. В реальном режиме состояние сохранено.[/bold red]")
+        console.print("\n[bold red]Процесс прерван.[/bold red]")
         sys.exit(1)
 
-    if all_jobs_successful and progress_bar.finished:
-        console.rule("[bold green]✅ Все задания успешно выполнены[/bold green]")
-    else:
-        console.rule("[bold yellow]Выполнение завершено, но были ошибки. Проверьте лог.[/bold yellow]")
+    total_duration = time.monotonic() - total_time_start
+    final_avg_speed = total_bytes_processed / total_duration if total_duration > 0 else 0
+
+    console.rule(f"[bold {'green' if all_jobs_successful else 'yellow'}]✅ Выполнение завершено[/bold {'green' if all_jobs_successful else 'yellow'}]")
+    console.print(f"  Общее время выполнения: {time.strftime('%H:%M:%S', time.gmtime(total_duration))}")
+    console.print(f"  Всего обработано данных: {decimal(total_bytes_processed)}")
+    console.print(f"  Средняя скорость: [bold magenta]{decimal(final_avg_speed)}/s[/bold magenta]")
+    if not all_jobs_successful: console.print("[yellow]В процессе работы были ошибки. Проверьте лог.[/yellow]")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Анализирует CSV, архивирует и копирует файлы в хранилище.",
-        prog="copeer"
-    )
-    parser.add_argument(
-        "-v", "--version",
-        action="version",
-        version=f"%(prog)s v{__version__}"
-    )
+    parser = argparse.ArgumentParser(description="Анализирует CSV, архивирует и копирует файлы.", prog="copeer")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s v{__version__}")
     parser.add_argument("input_file", help="Путь к CSV файлу со списком исходных файлов.")
     parser.add_argument("--dry-run", action="store_true", help="Выполнить анализ без реального копирования.")
     args = parser.parse_args()
