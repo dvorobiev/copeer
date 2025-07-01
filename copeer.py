@@ -329,11 +329,11 @@ def analyze_and_plan_jobs(input_csv_path, config):
     return jobs_to_process, plan_summary
 
 
+# Замените эту функцию целиком
 def process_job_worker(job, config, disk_manager):
     """
-    Обрабатывает одно задание с двумя режимами отображения прогресса:
-    - 'simple': (по умолчанию) Просто показывает имя файла. Надежно.
-    - 'advanced': Пытается показать живой прогресс rsync (может не работать).
+    Обрабатывает одно задание, избегая дедлока путем перенаправления
+    вывода rsync в DEVNULL в 'simple' режиме.
     """
     thread_id = get_ident()
     progress_mode = config.get('progress_mode', 'simple')
@@ -342,7 +342,6 @@ def process_job_worker(job, config, disk_manager):
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
 
-    # Устанавливаем начальный статус, который будет виден в любом режиме
     worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": None}
 
     try:
@@ -360,7 +359,6 @@ def process_job_worker(job, config, disk_manager):
 
         if job['type'] == 'sequence':
             if not is_dry_run:
-                # Архивация быстрая, живой прогресс не нужен
                 if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
             else: time.sleep(0.01)
             source_keys_to_log = job['source_files']
@@ -371,15 +369,15 @@ def process_job_worker(job, config, disk_manager):
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                # --- ЛОГИКА В ЗАВИСИМОСТИ ОТ РЕЖИМА ---
                 if progress_mode == 'advanced':
-                    # --- РЕЖИM 'ADVANCED' (может не работать) ---
+                    # РЕЖИM 'ADVANCED' (оставляем для экспериментов)
                     rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
                     process = subprocess.Popen(
                         rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True, bufsize=1, universal_newlines=True,
                         encoding='utf-8', errors='replace'
                     )
+                    # ... логика неблокирующего чтения ...
                     fd = process.stdout.fileno()
                     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
                     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -397,15 +395,15 @@ def process_job_worker(job, config, disk_manager):
                         except (IOError, TypeError):
                             time.sleep(0.1)
                 else:
-                    # --- РЕЖИМ 'SIMPLE' (надежный) ---
-                    # Просто запускаем и ждем завершения. Статус уже установлен.
+                    # --- ИСПРАВЛЕНИЕ ДЕДЛОКА: РЕЖИМ 'SIMPLE' ---
+                    # Не собираем вывод, а перенаправляем его в "черную дыру"
                     rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
-                    subprocess.run(rsync_cmd, check=True, capture_output=True)
-
-                # Проверяем код возврата для обоих режимов
-                if 'process' in locals() and process.poll() is not None:
-                     if process.returncode != 0 and process.returncode != 20:
-                        raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
+                    subprocess.run(
+                        rsync_cmd,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
 
             else: # dry_run
                 time.sleep(0.05)
