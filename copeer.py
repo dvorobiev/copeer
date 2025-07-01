@@ -476,12 +476,13 @@ def generate_workers_panel(threads) -> Panel:
 
 # Замените эту функцию целиком
 # Замените эту функцию целиком
+# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Smart Archiver & Copier v{__version__}[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Smart Archiver & Copier v2.4.2[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -520,55 +521,62 @@ def main(args):
     layout = make_layout()
     layout["bottom"].update(Panel(progress, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
 
+    # --- ИЗМЕНЕНИЕ: Создаем глобальные переменные для статистики, защищенные локом ---
+    global completed_stats, jobs_completed_count, all_jobs_successful
     completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
-    jobs_completed_count, all_jobs_successful = 0, True
+    jobs_completed_count = 0
+    all_jobs_successful = True
+    stats_lock = Lock() # Лок для безопасного изменения счетчиков из разных потоков
 
-    state_log = config['state_file']
-    mapping_log = config['dry_run_mapping_file'] if is_dry_run else config['mapping_file']
+    # --- ИЗМЕНЕНИЕ: Воркер теперь будет обновлять глобальные счетчики ---
+    def job_wrapper(job):
+        global completed_stats, jobs_completed_count, all_jobs_successful
+
+        source_keys, dest_path, size_processed, job_type = process_job_worker(job, config, disk_manager)
+
+        with stats_lock:
+            if source_keys is not None:
+                for key in source_keys:
+                    write_log(config['state_file'],
+                              config['dry_run_mapping_file'] if is_dry_run else config['mapping_file'],
+                              key, dest_path, is_dry_run=is_dry_run)
+
+                if job_type == 'sequence':
+                    completed_stats['sequence']['count'] += 1
+                    completed_stats['sequence']['size'] += size_processed
+                else:
+                    completed_stats['files']['count'] += 1
+                    completed_stats['files']['size'] += size_processed
+            else:
+                all_jobs_successful = False
+
+            jobs_completed_count += 1
+            progress.update(main_task, advance=1)
+            job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
 
     try:
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
-                # Отправляем все задания в пул
-                future_to_job = {executor.submit(process_job_worker, job, config, disk_manager): job for job in jobs_to_process}
+                # Отправляем все задания в пул, используя обертку
+                for job in jobs_to_process:
+                    executor.submit(job_wrapper, job)
 
-                # --- ИЗМЕНЕНИЕ: Правильный неблокирующий цикл ---
-                # Создаем итератор с таймаутом
-                futures = as_completed(future_to_job, timeout=0.5)
-
-                # Цикл работает, пока не обработаем все отправленные задания
+                # --- ИЗМЕНЕНИЕ: Главный цикл обновления TUI ---
                 while jobs_completed_count < len(jobs_to_process):
-                    try:
-                        # Пытаемся получить следующий завершенный результат
-                        future = next(futures)
-                        source_keys, dest_path, size_processed, job_type = future.result()
+                    # Блокируем статистику на время чтения, чтобы избежать гонки данных
+                    with stats_lock:
+                        layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
 
-                        if source_keys is not None:
-                            for key in source_keys: write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
-
-                            if job_type == 'sequence':
-                                completed_stats['sequence']['count'] += 1
-                                completed_stats['sequence']['size'] += size_processed
-                            else:
-                                completed_stats['files']['count'] += 1
-                                completed_stats['files']['size'] += size_processed
-                        else:
-                            all_jobs_successful = False
-
-                        jobs_completed_count += 1
-                        progress.update(main_task, advance=1)
-                        job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
-
-                    except TimeoutError:
-                        # Эта ошибка - наш друг! Она возникает, если за 0.5с ничего не завершилось.
-                        # Мы просто игнорируем ее, позволяя циклу дойти до обновления TUI.
-                        pass
-
-                    # Обновляем TUI в КАЖДОЙ итерации цикла, неважно, завершилась задача или нет
-                    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
                     if not is_dry_run:
                         layout["disks"].update(generate_disks_panel(disk_manager, config))
+
                     layout["middle"].update(generate_workers_panel(config['threads']))
+
+                    time.sleep(0.5) # Пауза между обновлениями TUI
+
+            # Финальное обновление после завершения всех потоков
+            layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+            layout["middle"].update(generate_workers_panel(config['threads']))
 
     except (KeyboardInterrupt, SystemExit):
         console.print("\n[bold red]Процесс прерван. В реальном режиме состояние сохранено.[/bold red]")
