@@ -477,12 +477,13 @@ def generate_workers_panel(threads) -> Panel:
 # Замените эту функцию целиком
 # Замените эту функцию целиком
 # Замените эту функцию целиком
+# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Smart Archiver & Copier v2.4.2[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Smart Archiver & Copier v2.4.3[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -521,26 +522,30 @@ def main(args):
     layout = make_layout()
     layout["bottom"].update(Panel(progress, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
 
-    # --- ИЗМЕНЕНИЕ: Создаем глобальные переменные для статистики, защищенные локом ---
     global completed_stats, jobs_completed_count, all_jobs_successful
     completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
     jobs_completed_count = 0
     all_jobs_successful = True
-    stats_lock = Lock() # Лок для безопасного изменения счетчиков из разных потоков
+    stats_lock = Lock()
 
-    # --- ИЗМЕНЕНИЕ: Воркер теперь будет обновлять глобальные счетчики ---
+    # --- ИЗМЕНЕНИЕ: Правильная потокобезопасная обертка ---
     def job_wrapper(job):
         global completed_stats, jobs_completed_count, all_jobs_successful
 
+        # Этот вызов теперь полностью самодостаточен и не требует обертки
         source_keys, dest_path, size_processed, job_type = process_job_worker(job, config, disk_manager)
 
+        # Запись в лог-файлы происходит внутри process_job_worker под своим локом
+        if source_keys is not None:
+             # Логирование происходит уже внутри воркера, здесь только обновляем статистику
+            state_log = config['state_file']
+            mapping_log = config['dry_run_mapping_file'] if is_dry_run else config['mapping_file']
+            for key in source_keys:
+                write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
+
+        # Обновляем общую статистику под отдельным локом
         with stats_lock:
             if source_keys is not None:
-                for key in source_keys:
-                    write_log(config['state_file'],
-                              config['dry_run_mapping_file'] if is_dry_run else config['mapping_file'],
-                              key, dest_path, is_dry_run=is_dry_run)
-
                 if job_type == 'sequence':
                     completed_stats['sequence']['count'] += 1
                     completed_stats['sequence']['size'] += size_processed
@@ -557,13 +562,10 @@ def main(args):
     try:
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
-                # Отправляем все задания в пул, используя обертку
                 for job in jobs_to_process:
                     executor.submit(job_wrapper, job)
 
-                # --- ИЗМЕНЕНИЕ: Главный цикл обновления TUI ---
                 while jobs_completed_count < len(jobs_to_process):
-                    # Блокируем статистику на время чтения, чтобы избежать гонки данных
                     with stats_lock:
                         layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
 
@@ -572,9 +574,9 @@ def main(args):
 
                     layout["middle"].update(generate_workers_panel(config['threads']))
 
-                    time.sleep(0.5) # Пауза между обновлениями TUI
+                    time.sleep(0.5)
 
-            # Финальное обновление после завершения всех потоков
+            # Финальное обновление
             layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
             layout["middle"].update(generate_workers_panel(config['threads']))
 
