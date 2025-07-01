@@ -330,8 +330,8 @@ def analyze_and_plan_jobs(input_csv_path, config):
 
 def process_job_worker(job, config, disk_manager):
     """
-    Обрабатывает одно задание, используя неблокирующее чтение stdout от rsync
-    для получения прогресса в реальном времени.
+    Обрабатывает одно задание, используя неблокирующее чтение fcntl
+    для гарантированного получения прогресса rsync в реальном времени.
     """
     thread_id = get_ident()
     is_dry_run = config['dry_run']
@@ -367,40 +367,52 @@ def process_job_worker(job, config, disk_manager):
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                rsync_cmd = [
-                    "rsync", "-a", "--checksum",
-                    "--info=progress2", "--no-i-r", "--outbuf=L",
-                    absolute_source_key, dest_path
-                ]
+                # Команда с флагами, которые заставляют rsync отдавать прогресс построчно
+                rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
 
                 process = subprocess.Popen(
                     rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, bufsize=1, universal_newlines=True,
-                    encoding='utf-8', errors='replace'
+                    text=True, encoding='utf-8', errors='replace'
                 )
 
-                # Неблокирующее чтение для получения прогресса
+                # --- ИЗМЕНЕНИЕ: Канонический способ неблокирующего чтения в Unix ---
+                # 1. Получаем файловый дескриптор stdout процесса
+                fd = process.stdout.fileno()
+                # 2. Устанавливаем флаг O_NONBLOCK, чтобы чтение не блокировалось
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+                # Улучшенный regex
                 progress_re = re.compile(r'\s*[\d,.]+[KMGT]?\s+(\d+)%\s+([\d.]+\w+/s)')
+                line_buffer = ""
 
                 while process.poll() is None:
-                    ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                    if ready:
-                        output = process.stdout.read()
-                        last_update = output.strip().split('\r')[-1]
-                        match = progress_re.search(last_update)
-                        if match:
-                            percent, speed = match.groups()
-                            worker_stats[thread_id]['progress'] = int(percent)
-                            worker_stats[thread_id]['speed'] = speed
+                    try:
+                        # 3. Пытаемся прочитать данные. Если их нет, будет IOError.
+                        chunk = process.stdout.read()
+                        if chunk:
+                            line_buffer += chunk
+                            # Обрабатываем все полные строки, которые могли накопиться
+                            lines = line_buffer.split('\r')
+                            # Последняя часть может быть неполной, сохраняем ее обратно в буфер
+                            line_buffer = lines.pop()
+                            for line in lines:
+                                match = progress_re.search(line)
+                                if match:
+                                    percent, speed = match.groups()
+                                    worker_stats[thread_id]['progress'] = int(percent)
+                                    worker_stats[thread_id]['speed'] = speed
+                    except (IOError, TypeError):
+                        # Ошибки ожидаемы, если данных для чтения пока нет. Просто ждем.
+                        time.sleep(0.1)
 
-                process.wait()
+                # Проверяем код возврата после завершения
                 if process.returncode != 0 and process.returncode != 20: # 20 = прерывание
                     raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
             else:
+                # Имитация для dry-run
                 for p in range(0, 101, 10):
-                    worker_stats[thread_id]['progress'] = p
-                    worker_stats[thread_id]['speed'] = "DRY RUN"
-                    time.sleep(0.05)
+                    worker_stats[thread_id]['progress'] = p; time.sleep(0.05)
 
         worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
         return source_keys_to_log, dest_path, job['size'], job['type']
