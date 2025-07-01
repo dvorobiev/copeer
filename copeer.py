@@ -332,16 +332,16 @@ def analyze_and_plan_jobs(input_csv_path, config):
 # Замените эту функцию целиком
 def process_job_worker(job, config, disk_manager):
     """
-    Обрабатывает одно задание, избегая дедлока путем перенаправления
-    вывода rsync в DEVNULL в 'simple' режиме.
+    Обрабатывает одно задание, используя единый неблокирующий подход для всех режимов.
+    Гарантирует отзывчивость TUI, показывая текущую задачу.
     """
     thread_id = get_ident()
-    progress_mode = config.get('progress_mode', 'simple')
     is_dry_run = config['dry_run']
 
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
 
+    # Устанавливаем начальный статус, который будет виден в TUI
     worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": None}
 
     try:
@@ -358,55 +358,38 @@ def process_job_worker(job, config, disk_manager):
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
 
         if job['type'] == 'sequence':
+            # Архивация обычно быстрая, просто выполняем
             if not is_dry_run:
-                if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
-            else: time.sleep(0.01)
+                if not archive_sequence_to_destination(job, dest_path):
+                    raise RuntimeError(f"Не удалось создать архив {short_name}")
+            else:
+                time.sleep(0.05) # Имитация работы для dry-run
             source_keys_to_log = job['source_files']
 
         else: # 'file'
+            # Копирование может быть долгим, используем неблокирующий Popen
             source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
-                if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
+                if not os.path.exists(absolute_source_key):
+                    raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                if progress_mode == 'advanced':
-                    # РЕЖИM 'ADVANCED' (оставляем для экспериментов)
-                    rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
-                    process = subprocess.Popen(
-                        rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, bufsize=1, universal_newlines=True,
-                        encoding='utf-8', errors='replace'
-                    )
-                    # ... логика неблокирующего чтения ...
-                    fd = process.stdout.fileno()
-                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                    progress_re = re.compile(r'\s*[\d,.]+[KMGT]?\s+(\d+)%\s+([\d.]+\w+/s)')
-                    while process.poll() is None:
-                        try:
-                            chunk = process.stdout.read()
-                            if chunk:
-                                last_update = chunk.strip().split('\r')[-1]
-                                match = progress_re.search(last_update)
-                                if match:
-                                    percent, speed = match.groups()
-                                    worker_stats[thread_id]['progress'] = int(percent)
-                                    worker_stats[thread_id]['speed'] = speed
-                        except (IOError, TypeError):
-                            time.sleep(0.1)
-                else:
-                    # --- ИСПРАВЛЕНИЕ ДЕДЛОКА: РЕЖИМ 'SIMPLE' ---
-                    # Не собираем вывод, а перенаправляем его в "черную дыру"
-                    rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
-                    subprocess.run(
-                        rsync_cmd,
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
+                # --- ИЗМЕНЕНИЕ: Единый подход через Popen ---
+                rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
 
-            else: # dry_run
-                time.sleep(0.05)
+                # Запускаем rsync и немедленно продолжаем, не блокируя поток
+                process = subprocess.Popen(rsync_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+                # Просто ждем завершения в цикле, позволяя TUI обновляться
+                while process.poll() is None:
+                    time.sleep(0.2) # Небольшая пауза, чтобы не нагружать CPU
+
+                # Проверяем код возврата после завершения
+                if process.returncode != 0:
+                    stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
+                    raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=stderr_output)
+            else:
+                time.sleep(0.05) # Имитация работы для dry-run
 
         worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
         return source_keys_to_log, dest_path, job['size'], job['type']
