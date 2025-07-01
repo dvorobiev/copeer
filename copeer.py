@@ -491,12 +491,14 @@ def generate_workers_panel(threads) -> Panel:
 
 # --- Точка входа ---
 
+# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Smart Archiver & Copier v{__version__}[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    # --- ИЗМЕНЕНИЕ: Обновляем версию для фикса ---
+    console.rule(f"[bold]Smart Archiver & Copier v2.4.1[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -542,36 +544,41 @@ def main(args):
     mapping_log = config['dry_run_mapping_file'] if is_dry_run else config['mapping_file']
 
     try:
-        with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
+        with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
                 layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
                 layout["disks"].update(generate_disks_panel(disk_manager, config))
                 layout["middle"].update(generate_workers_panel(config['threads']))
 
                 future_to_job = {executor.submit(process_job_worker, job, config, disk_manager): job for job in jobs_to_process}
-                futures = as_completed(future_to_job, timeout=0.5)
 
-                while jobs_completed_count < len(jobs_to_process):
-                    try:
-                        future = next(futures)
-                        source_keys, dest_path, size_processed, job_type = future.result()
-
-                        if source_keys is not None:
-                            for key in source_keys: write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
-
-                            if job_type == 'sequence': completed_stats['sequence']['count'] += 1; completed_stats['sequence']['size'] += size_processed
-                            else: completed_stats['files']['count'] += 1; completed_stats['files']['size'] += size_processed
-                        else: all_jobs_successful = False
-
-                        jobs_completed_count += 1
-                        progress.update(main_task, advance=1)
-                        job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
-
-                    except TimeoutError: pass # Ожидаемая ошибка, используем для обновления TUI
-
-                    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-                    if not is_dry_run: layout["disks"].update(generate_disks_panel(disk_manager, config))
+                # --- ИЗМЕНЕНИЕ: Возвращаемся к простому и надежному циклу for ---
+                for future in as_completed(future_to_job):
+                    # Обновляем панели в начале каждой итерации для отзывчивости
                     layout["middle"].update(generate_workers_panel(config['threads']))
+
+                    source_keys, dest_path, size_processed, job_type = future.result()
+
+                    if source_keys is not None:
+                        for key in source_keys: write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
+
+                        if job_type == 'sequence':
+                            completed_stats['sequence']['count'] += 1
+                            completed_stats['sequence']['size'] += size_processed
+                        else:
+                            completed_stats['files']['count'] += 1
+                            completed_stats['files']['size'] += size_processed
+                    else:
+                        all_jobs_successful = False
+
+                    jobs_completed_count += 1
+                    progress.update(main_task, advance=1)
+                    job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+
+                    # Обновляем панели после обработки результата
+                    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+                    if not is_dry_run:
+                        layout["disks"].update(generate_disks_panel(disk_manager, config))
 
     except (KeyboardInterrupt, SystemExit):
         console.print("\n[bold red]Процесс прерван. В реальном режиме состояние сохранено.[/bold red]")
