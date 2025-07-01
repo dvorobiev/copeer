@@ -1,32 +1,15 @@
-# copeer.py
+# copeer_rich_TUI.py
 """
 Утилита для архивации и параллельного копирования больших объемов данных
 с TUI-дашбордом на базе Rich и возможностью возобновления работы.
 """
 
 # Стандартная библиотека
-import argparse
-import csv
-import logging
-import os
-import re
-import subprocess
-import sys
-import tarfile
-import time
-import yaml
+import argparse, csv, logging, os, re, subprocess, sys, tarfile, time, yaml, math
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock, get_ident
-
-# Импорты для Unix-систем (для живого прогресса rsync)
-try:
-    import fcntl
-    import select
-    UNIX_SYSTEM = True
-except ImportError:
-    UNIX_SYSTEM = False
 
 # Сторонние библиотеки
 from rich.console import Console
@@ -42,7 +25,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "3.1.0"  # Добавлена статистика по скорости
+__version__ = "4.2.0"
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
     'mount_points': ["/mnt/disk1", "/mnt/disk2"],
@@ -57,7 +40,6 @@ DEFAULT_CONFIG = {
     'threads': 8,
     'min_files_for_sequence': 50,
     'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
-    'progress_mode': 'advanced' if UNIX_SYSTEM else 'simple'
 }
 SEQUENCE_RE = re.compile(r'^(.*?)[\._]*(\d+)\.([a-zA-Z0-9]+)$', re.IGNORECASE)
 
@@ -65,7 +47,7 @@ logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers
 log = logging.getLogger("rich")
 
 file_lock = Lock()
-worker_stats = defaultdict(lambda: {"status": "[grey50]Ожидание...[/grey50]", "speed": "", "progress": None})
+worker_stats = defaultdict(lambda: {"status": "[grey50]Ожидание...[/grey50]"})
 
 
 # --- Основные классы ---
@@ -73,32 +55,23 @@ worker_stats = defaultdict(lambda: {"status": "[grey50]Ожидание...[/grey
 class DiskManager:
     """Управляет выбором диска для записи."""
     def __init__(self, mount_points, threshold):
-        self.mount_points = mount_points
-        self.threshold = threshold
-        self.active_disk = None
-        self.lock = Lock()
+        self.mount_points, self.threshold, self.active_disk, self.lock = mount_points, threshold, None, Lock()
         self._select_initial_disk()
 
     def _get_disk_usage(self, path):
         if not os.path.exists(path): return 0.0
         try:
-            st = os.statvfs(path)
-            used = (st.f_blocks - st.f_bfree) * st.f_frsize
-            total = st.f_blocks * st.f_frsize
+            st = os.statvfs(path); used = (st.f_blocks - st.f_bfree) * st.f_frsize; total = st.f_blocks * st.f_frsize
             return round(used / total * 100, 2) if total > 0 else 0
         except FileNotFoundError: return 100
 
     def _select_initial_disk(self):
         for mount in self.mount_points:
             if not os.path.exists(mount):
-                log.warning(f"Точка монтирования [bold yellow]{mount}[/bold yellow] не существует. Пропускаю.")
-                continue
+                log.warning(f"Точка монтирования [bold yellow]{mount}[/bold yellow] не существует. Пропускаю."); continue
             if self._get_disk_usage(mount) < self.threshold:
-                self.active_disk = mount
-                log.info(f"Выбран начальный диск: [bold green]{self.active_disk}[/bold green]")
-                return
-        log.error("🛑 Не найдено подходящих дисков для начала работы.")
-        raise RuntimeError("Не найдено подходящих дисков")
+                self.active_disk = mount; log.info(f"Выбран начальный диск: [bold green]{self.active_disk}[/bold green]"); return
+        log.error("🛑 Не найдено подходящих дисков для начала работы."); raise RuntimeError("Не найдено подходящих дисков")
 
     def get_current_destination(self):
         with self.lock:
@@ -177,109 +150,79 @@ def archive_sequence_to_destination(job, dest_tar_path):
             if os.path.exists(file_path): tar.add(file_path, arcname=os.path.basename(file_path))
             else: log.warning(f"В секвенции не найден файл: {file_path}")
 
+def parse_scientific_notation(size_str: str) -> int:
+    try:
+        cleaned_str = size_str.replace(',', '.').strip()
+        if 'E' in cleaned_str.upper(): return int(float(cleaned_str))
+        return int(cleaned_str)
+    except (ValueError, TypeError): return 0
+
+
 # --- Логика анализа и выполнения ---
 
 def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
     console.rule("[yellow]Шаг 1: Анализ и планирование[/]")
     console.print(f"Анализ файла: [bold cyan]{input_csv_path}[/bold cyan]")
-
-    parser_primary = re.compile(r'^"([^"]+)","([^"]+)",.*')
-    parser_fallback = re.compile(r'^"([^"]+\.\w{2,5})",.*', re.IGNORECASE)
-
     dirs, all_files_from_csv = defaultdict(list), {}
     source_root = config.get('source_root')
-    if source_root:
-        console.print(f"Используется корень источника: [cyan]{source_root}[/cyan]")
-
+    if source_root: console.print(f"Используется корень источника: [cyan]{source_root}[/cyan]")
     lines_total, lines_ignored_dirs, malformed_lines = 0, 0, []
 
     try:
         with open(input_csv_path, 'r', encoding='utf-8', errors='ignore') as f: total_lines_for_progress = sum(1 for _ in f)
-
         with Progress(console=console) as progress:
             task = progress.add_task("[green]Анализ CSV...", total=total_lines_for_progress)
             with open(input_csv_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
+                reader = csv.reader(f, delimiter=';')
+                for i, row in enumerate(reader):
                     progress.update(task, advance=1)
                     lines_total += 1
-                    cleaned_line = line.strip().replace('""', '"')
-                    if not cleaned_line:
-                        malformed_lines.append((lines_total, line, "Пустая строка")); continue
-
-                    rel_path, file_type, size = None, "", 0
-                    match = parser_primary.match(cleaned_line)
-                    if match:
-                        rel_path, file_type = match.groups()
-                    else:
-                        match = parser_fallback.match(cleaned_line)
-                        if match: rel_path, file_type = match.group(1), "file"
-
-                    if rel_path:
-                        if 'directory' in file_type:
-                            lines_ignored_dirs += 1; continue
-
-                        size_match = re.search(r',"(\d+)"$', cleaned_line)
-                        if size_match:
-                            try: size = int(size_match.group(1))
-                            except (ValueError, IndexError): size = 0
-
-                        absolute_source_path = os.path.normpath(os.path.join(source_root, rel_path) if source_root else rel_path)
-                        path_obj = Path(absolute_source_path)
-                        dirs[str(path_obj.parent)].append((path_obj.name, size))
-                        all_files_from_csv[absolute_source_path] = size
-                    else:
-                        malformed_lines.append((lines_total, line, "Неизвестный формат строки"))
-
+                    if not row or len(row) < 5: malformed_lines.append((i + 1, str(row), "Недостаточно колонок")); continue
+                    rel_path, file_type, size_str = row[0], row[1], row[4]
+                    if 'directory' in file_type: lines_ignored_dirs += 1; continue
+                    if 'file' not in file_type: malformed_lines.append((i + 1, str(row), f"Неизвестный тип: {file_type}")); continue
+                    size = parse_scientific_notation(size_str)
+                    if size == 0 and size_str.strip() not in ('0', ''): malformed_lines.append((i + 1, str(row), f"Некорректный размер: {size_str}"))
+                    absolute_source_path = os.path.normpath(os.path.join(source_root, rel_path) if source_root else rel_path)
+                    path_obj = Path(absolute_source_path)
+                    dirs[str(path_obj.parent)].append((path_obj.name, size))
+                    all_files_from_csv[absolute_source_path] = size
     except (KeyboardInterrupt, SystemExit): console.print("\n[yellow]Анализ прерван пользователем.[/yellow]"); sys.exit(0)
-    except FileNotFoundError: console.print(f"[bold red]Критическая ошибка: CSV-файл не найден: {input_csv_path}[/]"); sys.exit(1)
-    except Exception as e: console.print(f"[bold red]Критическая ошибка при чтении CSV: {e}[/]"); sys.exit(1)
+    except Exception as e: console.print(f"[bold red]Критическая ошибка при чтении CSV: {e}[/bold red]"); sys.exit(1)
 
-    if not all_files_from_csv:
-        if malformed_lines:
-            console.print("\n[bold red]Не найдено корректных файлов. Обнаружены проблемы:[/bold red]")
-            for num, err_line, reason in malformed_lines[:50]: console.print(f"[dim]Строка #{num} ({reason}):[/dim] {err_line}")
-        else: log.warning("В CSV не найдено ни одного файла для обработки.")
-        sys.exit(0)
+    if not all_files_from_csv: sys.exit(0)
 
     sequences, sequence_files = find_sequences(dirs, config)
     standalone_files = set(all_files_from_csv.keys()) - sequence_files
-
-    jobs = sequences + [{'type': 'file', 'key': f, 'size': all_files_from_csv[f]} for f in standalone_files]
-    jobs_to_process = [job for job in jobs if job['key'] not in processed_items_keys]
-
-    if not jobs_to_process:
-        log.info("[bold green]✅ Все задания из входного файла уже выполнены. Завершение.[/bold green]")
-        return [], None
-
-    jobs_to_process.sort(key=lambda j: j.get('size', 0), reverse=True)
-    seq_jobs = [j for j in jobs_to_process if j['type'] == 'sequence']
-    file_jobs = [j for j in jobs_to_process if j['type'] == 'file']
+    archive_jobs_all = sequences
+    copy_jobs_all = [{'type': 'file', 'key': f, 'size': all_files_from_csv[f]} for f in standalone_files]
+    archive_jobs_to_process = [job for job in archive_jobs_all if job['key'] not in processed_items_keys]
+    copy_jobs_to_process = [job for job in copy_jobs_all if job['key'] not in processed_items_keys]
+    archive_jobs_to_process.sort(key=lambda j: j.get('size', 0), reverse=True)
+    copy_jobs_to_process.sort(key=lambda j: j.get('size', 0), reverse=True)
 
     while True:
         console.rule("[yellow]Отчет по анализу[/]")
         report_table = Table(title=None, show_header=False, box=None, padding=(0, 2))
         report_table.add_column("Параметр", style="cyan", no_wrap=True)
         report_table.add_column("Значение", style="white", justify="right")
-
         report_table.add_row("Всего строк в CSV файле:", f"{lines_total:,}")
         report_table.add_row("  Пропущено (директории):", f"[dim]{lines_ignored_dirs:,}[/dim]")
         malformed_count = len(malformed_lines)
-        report_table.add_row(f"  Пропущено (неопознанный формат):", f"[{'red' if malformed_count > 0 else 'dim'}]{malformed_count:,}[/]")
+        report_table.add_row(f"  Пропущено (некорректный формат):", f"[{'red' if malformed_count > 0 else 'dim'}]{malformed_count:,}[/]")
         report_table.add_row("[bold]Найдено файлов для обработки:", f"[bold green]{len(all_files_from_csv):,}[/bold green]")
         report_table.add_section()
-        report_table.add_row("Из них сгруппировано в секвенции:", f"{len(sequence_files):,}")
-        report_table.add_row("  Что соответствует заданиям на архивацию:", f"[yellow]{len(sequences):,}[/yellow]")
-        report_table.add_row("Осталось отдельных файлов для копирования:", f"{len(standalone_files):,}")
-        report_table.add_section()
-        report_table.add_row("Всего заданий до возобновления:", f"{len(jobs):,}")
-        report_table.add_row("  Пропущено (уже выполнены):", f"[dim]{len(jobs) - len(jobs_to_process):,}[/dim]")
-        report_table.add_row("[bold]Всего заданий к выполнению:", f"[bold bright_magenta]{len(jobs_to_process):,}[/bold bright_magenta]")
+        archive_size = sum(j.get('size', 0) for j in archive_jobs_to_process)
+        copy_size = sum(j.get('size', 0) for j in copy_jobs_to_process)
+        report_table.add_row("Заданий на архивацию:", f"[yellow]{len(archive_jobs_to_process):,}[/yellow] ({decimal(archive_size)})")
+        report_table.add_row("Заданий на копирование:", f"[yellow]{len(copy_jobs_to_process):,}[/yellow] ({decimal(copy_size)})")
+        report_table.add_row("Пропущено (уже выполнены):", f"[dim]{(len(archive_jobs_all) + len(copy_jobs_all)) - (len(archive_jobs_to_process) + len(copy_jobs_to_process)):,}[/dim]")
 
         console.print(report_table)
 
         choices = ["s", "q"]
         prompt_text = "\n[bold]Выберите действие: ([green]S[/green])тарт / ([red]Q[/red])uit"
-        if malformed_count > 0:
+        if malformed_lines:
             choices.append("e")
             prompt_text += " / ([yellow]E[/yellow])rrors"
 
@@ -287,30 +230,29 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
 
         if choice == 's': break
         elif choice == 'q': console.print("[yellow]Выполнение отменено пользователем.[/yellow]"); sys.exit(0)
-        elif choice == 'e' and malformed_count > 0:
+        elif choice == 'e' and malformed_lines:
             console.print("\n[bold yellow]----- Список некорректных строк (первые 50) -----[/bold yellow]")
             for num, line, reason in malformed_lines[:50]: console.print(f"[dim]Строка #{num} ({reason}):[/dim] {line}")
             console.input("\n[bold]Нажмите [green]Enter[/green] для возврата в меню...[/bold]")
             console.clear()
 
-    plan_summary = {
-        "sequences": {"count": len(seq_jobs), "size": sum(j['size'] for j in seq_jobs)},
-        "files": {"count": len(file_jobs), "size": sum(j['size'] for j in file_jobs)},
-        "total": {"count": len(jobs_to_process), "size": sum(j['size'] for j in jobs_to_process)},
-        "skipped": len(jobs) - len(jobs_to_process)
-    }
-    return jobs_to_process, plan_summary
+    return copy_jobs_to_process, archive_jobs_to_process
 
 
-def process_job_worker(job, config, disk_manager):
-    thread_id = get_ident()
-    progress_mode = config.get('progress_mode', 'simple')
+# Замените эту функцию целиком
+def process_job_worker(worker_id, job, config, disk_manager):
+    """
+    Обрабатывает одно задание, используя переданный ID для обновления статуса.
+    """
     is_dry_run = config['dry_run']
-
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
-    status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
+    op_type_text = "[yellow]Архивирую[/yellow]:" if job['type'] == 'sequence' else "[cyan]Копирую[/cyan]:"
 
-    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0 if progress_mode == 'advanced' and not is_dry_run else None}
+    # Используем переданный worker_id
+    worker_stats[worker_id] = {
+        "status": f"{op_type_text} {short_name}",
+        "job_info": job
+    }
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
@@ -325,45 +267,31 @@ def process_job_worker(job, config, disk_manager):
 
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
 
+        source_keys_to_log = []
         if job['type'] == 'sequence':
-            if not is_dry_run: archive_sequence_to_destination(job, dest_path)
-            else: time.sleep(0.01)
+            if not is_dry_run:
+                if not archive_sequence_to_destination(job, dest_path):
+                    raise RuntimeError(f"Не удалось создать архив {short_name}")
+            else:
+                time.sleep(0.05)
             source_keys_to_log = job['source_files']
         else: # 'file'
             source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
-                if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
+                if not os.path.exists(absolute_source_key):
+                    raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-
-                if progress_mode == 'advanced' and UNIX_SYSTEM:
-                    rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
-                    process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True, encoding='utf-8', errors='replace')
-                    fd = process.stdout.fileno()
-                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                    progress_re = re.compile(r'\s*[\d,.]+[KMGT]?\s+(\d+)%\s+([\d.]+\w+/s)')
-                    while process.poll() is None:
-                        try:
-                            chunk = process.stdout.read()
-                            if chunk:
-                                last_update = chunk.strip().split('\r')[-1]
-                                match = progress_re.search(last_update)
-                                if match: worker_stats[thread_id]['progress'], worker_stats[thread_id]['speed'] = int(match.group(1)), match.group(2)
-                        except (IOError, TypeError): time.sleep(0.1)
-                    if process.wait() != 0 and process.returncode != 20:
-                        raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
-                else: # 'simple' mode
-                    rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
-                    subprocess.run(rsync_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else: # dry_run
+                rsync_cmd = ["rsync", "-a", absolute_source_key, dest_path]
+                subprocess.run(rsync_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            else:
                 time.sleep(0.05)
 
-        worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
+        worker_stats[worker_id]['status'] = "[green]Свободен[/green]"
         return (job['type'], job['size'], source_keys_to_log, dest_path)
 
     except Exception as e:
         if not isinstance(e, KeyboardInterrupt):
-            worker_stats[thread_id] = {"status": f"[red]Ошибка:[/] {short_name}", "speed": "ERROR", "progress": None}
+            worker_stats[worker_id]['status'] = f"[red]Ошибка:[/] {short_name}"
             log.error(f"Ошибка при обработке {job['key']}: {e}")
             with file_lock:
                  with open(config['error_log_file'], "a", encoding='utf-8') as f:
@@ -371,7 +299,7 @@ def process_job_worker(job, config, disk_manager):
         return (None, 0, None, None)
 
 
-# --- Функции для отрисовки TUI ---
+# --- Функции TUI ---
 
 def make_layout() -> Layout:
     layout = Layout(name="root")
@@ -385,60 +313,61 @@ def generate_summary_panel(plan, completed) -> Panel:
     table.add_column("Выполнено", style="green", justify="right")
     table.add_column("Размер", style="green", justify="right")
 
-    s_done, s_total, s_size_done, s_size_total = completed['sequence']['count'], plan['sequences']['count'], completed['sequence']['size'], plan['sequences']['size']
+    s_plan = plan.get('sequences', {})
+    f_plan = plan.get('files', {})
+    s_done, s_total = completed['sequence']['count'], s_plan.get('count', 0)
+    s_size_done, s_size_total = completed['sequence']['size'], s_plan.get('size', 0)
     table.add_row("Архивация", f"{s_done} / {s_total}", f"{decimal(s_size_done)} / {decimal(s_size_total)}")
-
-    f_done, f_total, f_size_done, f_size_total = completed['files']['count'], plan['files']['count'], completed['files']['size'], plan['files']['size']
+    f_done, f_total = completed['files']['count'], f_plan.get('count', 0)
+    f_size_done, f_size_total = completed['files']['size'], f_plan.get('size', 0)
     table.add_row("Копирование", f"{f_done} / {f_total}", f"{decimal(f_size_done)} / {decimal(f_size_total)}")
-
-    table.add_row("[bold]Всего[/bold]", f"[bold]{s_done + f_done} / {s_total + f_total}[/bold]", f"[bold]{decimal(s_size_done + f_size_done)} / {decimal(s_size_total + f_size_total)}[/bold]")
+    total_count_done, total_count_plan = s_done + f_done, s_total + f_total
+    total_size_done, total_size_plan = s_size_done + f_size_done, s_size_total + f_size_total
+    table.add_row("[bold]Всего[/bold]", f"[bold]{total_count_done} / {total_count_plan}[/bold]", f"[bold]{decimal(total_size_done)} / {decimal(total_size_plan)}[/bold]")
     return Panel(table, title="📊 План выполнения", border_style="yellow")
 
-# Замените эту функцию целиком
 def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
-    """Генерирует панель со статусом дисков."""
     table = Table(box=None, expand=True)
     table.add_column("Диск", style="white", no_wrap=True)
+    table.add_column("Размер", style="dim", justify="right")
     table.add_column("Заполнено", style="green", ratio=1)
     table.add_column("%", style="bold", justify="right")
-
     for mount, percent in disk_manager.get_all_disks_status():
         color = "green" if percent < config['threshold'] else "red"
-
-        # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
-        # Стили `style` и `complete_style` передаются в BarColumn, а не в Progress
-        bar = Progress(
-            BarColumn(
-                bar_width=None,
-                style=color,
-                complete_style=color
-            )
-        )
-        # ------------------------
-
+        try:
+            st = os.statvfs(mount)
+            total = st.f_blocks * st.f_frsize
+            used = total - (st.f_bfree * st.f_frsize)
+            size_str = f"{decimal(used)} / {decimal(total)}"
+        except FileNotFoundError: size_str = "[red]Н/Д[/red]"
+        bar = Progress(BarColumn(bar_width=None, style=color, complete_style=color))
         bar.add_task("d", total=100, completed=percent)
         is_active = " (*)" if mount == disk_manager.active_disk else ""
-        table.add_row(f"[bold]{mount}{is_active}[/bold]", bar, f"{percent:.1f}%")
-
+        table.add_row(f"[bold]{mount}{is_active}[/bold]", size_str, bar, f"{percent:.1f}%")
     return Panel(table, title="📦 Диски", border_style="blue")
 
+# Замените эту функцию целиком
 def generate_workers_panel(threads) -> Panel:
-    table = Table.grid(expand=True, padding=(0, 1))
-    table.add_column("Поток", justify="center", style="cyan", width=12)
-    table.add_column("Статус", style="white", no_wrap=True)
+    """Генерирует панель потоков с жестким выравниванием."""
+    # Используем Table, а не Table.grid
+    table = Table(box=None, expand=True, show_header=False)
+    table.add_column("Размер", justify="right", style="cyan", width=12, no_wrap=True)
+    table.add_column("Статус", justify="left", style="white", no_wrap=True) # justify="left"
 
-    for tid in sorted(worker_stats.keys()):
-        stats = worker_stats.get(tid, {})
-        status = stats.get("status", "[grey50]Ожидание...[/grey50]")
-        progress_val = stats.get("progress")
+    # Создаем полный список слотов, даже если они еще не работают
+    all_worker_slots = list(range(1, threads + 1))
 
-        if progress_val is not None and 0 <= progress_val <= 100:
-            p_bar = Progress(BarColumn(bar_width=None), TextColumn("{task.percentage:>3.0f}%"))
-            p_bar.add_task("p", total=100, completed=progress_val)
-            status_grid = Table.grid(expand=True); status_grid.add_row(status); status_grid.add_row(p_bar)
-            table.add_row(str(tid), status_grid)
+    for worker_id in all_worker_slots:
+        stats = worker_stats.get(worker_id)
+
+        if stats and stats.get("status") != "[green]Свободен[/green]":
+            status_text = stats.get("status")
+            job_info = stats.get("job_info")
+            size_str = decimal(job_info['size']) if job_info and 'size' in job_info else "[dim]---[/dim]"
+            table.add_row(size_str, status_text)
         else:
-            table.add_row(str(tid), status)
+            # Если слот свободен или еще не запущен
+            table.add_row("[dim]---[/dim]", "[green]Свободен[/green]")
 
     return Panel(table, title=f"👷 Потоки ({threads})", border_style="green")
 
@@ -446,12 +375,13 @@ def generate_workers_panel(threads) -> Panel:
 # --- Точка входа ---
 
 # Замените эту функцию целиком
+# Замените эту функцию целиком
 def main(args):
-    """Главная функция скрипта."""
+    """Главная функция скрипта с двухфазным выполнением и надежным TUI."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Copeer v3.0.2[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Copeer v4.3.0[/bold] | Двухфазное выполнение")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -465,77 +395,112 @@ def main(args):
     processed_items_keys = set()
     load_previous_state(config['state_file'], processed_items_keys)
 
-    jobs_to_process, plan_summary = analyze_and_plan_jobs(args.input_file, config, processed_items_keys)
-    if not jobs_to_process: return
+    copy_jobs, archive_jobs = analyze_and_plan_jobs(args.input_file, config, processed_items_keys)
+
+    if not copy_jobs and not archive_jobs:
+        return
 
     disk_manager = DiskManager(config['mount_points'], config['threshold']) if not is_dry_run else type('FakeDisk', (), {'active_disk': config['mount_points'][0] if config['mount_points'] else "/dry/run/dest", 'get_current_destination': lambda self: self.active_disk, 'get_all_disks_status': lambda self: [(p, 0.0) for p in config['mount_points']]})()
     if not is_dry_run and not disk_manager.active_disk: return
 
-    console.rule("[yellow]Шаг 2: Выполнение[/]")
-    time.sleep(1)
+    total_time_start = time.monotonic()
+    all_jobs_successful = True
+    total_bytes_processed = 0
 
-    layout = make_layout()
-    completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
+    # --- ФАЗА 1: КОПИРОВАНИЕ ФАЙЛОВ (МНОГОПОТОЧНОЕ) ---
+    if copy_jobs:
+        console.rule(f"[yellow]Фаза 1: Копирование {len(copy_jobs)} файлов[/yellow]")
+        time.sleep(1)
 
-    job_counter_column = TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]")
-    progress_bar = Progress(TextColumn("[bold blue]Общий прогресс:[/bold blue]"), BarColumn(), TaskProgressColumn(), TextColumn("•"),
-                            job_counter_column, TextColumn("•"), TransferSpeedColumn(), TextColumn("•"), TimeRemainingColumn())
-    main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['count'])
+        layout = make_layout()
+        # Статистика будет обновляться для обеих фаз
+        completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
 
-    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-    layout["disks"].update(generate_disks_panel(disk_manager, config))
-    layout["middle"].update(generate_workers_panel(config['threads']))
-    layout["bottom"].update(Panel(progress_bar, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
+        # Полный план для отображения
+        plan_summary = {
+            "sequences": {"count": len(archive_jobs), "size": sum(j.get('size', 0) for j in archive_jobs)},
+            "files": {"count": len(copy_jobs), "size": sum(j.get('size', 0) for j in copy_jobs)}
+        }
 
-    jobs_completed_count, all_jobs_successful = 0, True
+        job_counter_column = TextColumn(f"[cyan]0/{len(copy_jobs)}[/cyan]")
+        progress_bar = Progress(TextColumn("[bold blue]Копирование:[/bold blue]"), BarColumn(), TaskProgressColumn(), "•", job_counter_column, "•", TransferSpeedColumn())
+        main_task = progress_bar.add_task("copying", total=sum(j.get('size', 0) for j in copy_jobs))
 
-    # --- ИСПРАВЛЕНИЕ: Засекаем время старта здесь ---
-    execution_start_time = time.monotonic()
+        layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+        layout["disks"].update(generate_disks_panel(disk_manager, config))
+        layout["middle"].update(generate_workers_panel(config['threads']))
+        layout["bottom"].update(Panel(progress_bar, title="🚀 Фаза 1: Копирование", border_style="magenta"))
 
-    try:
-        with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
-            with ThreadPoolExecutor(max_workers=config['threads']) as executor:
+        try:
+            with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=2) as live:
+                with ThreadPoolExecutor(max_workers=config['threads']) as executor:
 
-                future_to_job = {executor.submit(process_job_worker, job, config, disk_manager): job for job in jobs_to_process}
+                    # Система очередей для ID воркеров
+                    worker_id_queue = list(range(1, config['threads'] + 1))
+                    id_lock = Lock()
 
-                for future in as_completed(future_to_job):
-                    job_type, size_processed, source_keys, dest_path = future.result()
+                    def get_worker_id():
+                        with id_lock: return worker_id_queue.pop(0) if worker_id_queue else None
 
-                    if job_type:
-                        for key in source_keys:
-                            write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
+                    def release_worker_id(worker_id):
+                        if worker_id is not None:
+                            with id_lock: worker_id_queue.append(worker_id)
 
-                        if job_type == 'sequence':
-                            completed_stats['sequence']['count'] += 1; completed_stats['sequence']['size'] += size_processed
-                        else:
-                            completed_stats['files']['count'] += 1; completed_stats['files']['size'] += size_processed
-                    else:
-                        all_jobs_successful = False
+                    def job_wrapper(job):
+                        worker_id = get_worker_id()
+                        try:
+                            return process_job_worker(worker_id, job, config, disk_manager)
+                        finally:
+                            release_worker_id(worker_id)
 
-                    jobs_completed_count += 1
-                    progress_bar.update(main_task, advance=1)
-                    job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+                    future_to_job = {executor.submit(job_wrapper, job): job for job in copy_jobs}
 
-                    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-                    if not is_dry_run:
-                        layout["disks"].update(generate_disks_panel(disk_manager, config))
-                    layout["middle"].update(generate_workers_panel(config['threads']))
+                    for future in as_completed(future_to_job):
+                        job_type, size_processed, source_keys, dest_path = future.result()
 
-    except (KeyboardInterrupt, SystemExit):
-        console.print("\n[bold red]Процесс прерван.[/bold red]")
-        sys.exit(1)
+                        if job_type:
+                            for key in source_keys: write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
+                            completed_stats['files']['count'] += 1
+                            completed_stats['files']['size'] += size_processed
+                            total_bytes_processed += size_processed
+                        else: all_jobs_successful = False
 
-    # --- ИСПРАВЛЕНИЕ: Используем нашу переменную для расчета времени ---
-    total_duration = time.monotonic() - execution_start_time
-    total_bytes_processed = completed_stats['sequence']['size'] + completed_stats['files']['size']
+                        progress_bar.update(main_task, advance=size_processed)
+                        job_counter_column.text_format = f"[cyan]{completed_stats['files']['count']}/{len(copy_jobs)}[/cyan]"
+
+                        layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+                        if not is_dry_run: layout["disks"].update(generate_disks_panel(disk_manager, config))
+                        layout["middle"].update(generate_workers_panel(config['threads']))
+        except (KeyboardInterrupt, SystemExit):
+            console.print("\n[bold red]Процесс прерван.[/bold red]"); sys.exit(1)
+
+    # --- ФАЗА 2: АРХИВАЦИЯ СЕКВЕНЦИЙ (ОДНОПОТОЧНАЯ) ---
+    if archive_jobs:
+        console.rule(f"[yellow]Фаза 2: Архивация {len(archive_jobs)} секвенций (в 1 поток)[/yellow]")
+
+        with Progress(console=console, transient=True) as progress:
+            task = progress.add_task("[green]Архивация...", total=len(archive_jobs))
+            for i, job in enumerate(archive_jobs):
+                progress.update(task, description=f"[green]Архивация [/][cyan]({i+1}/{len(archive_jobs)})[/]: [yellow]{job['tar_filename']}[/yellow]")
+
+                # Используем worker_id = 1 для однопоточной фазы
+                job_type, size_processed, source_keys, dest_path = process_job_worker(1, job, config, disk_manager)
+
+                if job_type:
+                    for key in source_keys: write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
+                    total_bytes_processed += size_processed
+                else: all_jobs_successful = False
+
+                progress.update(task, advance=1)
+
+    # --- Итоговая статистика ---
+    total_duration = time.monotonic() - total_time_start
     final_avg_speed = total_bytes_processed / total_duration if total_duration > 0 else 0
-
     console.rule(f"[bold {'green' if all_jobs_successful else 'yellow'}]Выполнение завершено[/bold {'green' if all_jobs_successful else 'yellow'}]")
     console.print(f"  Общее время выполнения: {time.strftime('%H:%M:%S', time.gmtime(total_duration))}")
     console.print(f"  Всего обработано данных: {decimal(total_bytes_processed)}")
     console.print(f"  Средняя скорость: [bold magenta]{decimal(final_avg_speed)}/s[/bold magenta]")
-    if not all_jobs_successful:
-        console.print("[yellow]В процессе работы были ошибки. Проверьте лог.[/yellow]")
+    if not all_jobs_successful: console.print("[yellow]В процессе работы были ошибки. Проверьте лог.[/yellow]")
 
 
 if __name__ == "__main__":
