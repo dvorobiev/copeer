@@ -394,17 +394,32 @@ def generate_summary_panel(plan, completed) -> Panel:
     table.add_row("[bold]Всего[/bold]", f"[bold]{s_done + f_done} / {s_total + f_total}[/bold]", f"[bold]{decimal(s_size_done + f_size_done)} / {decimal(s_size_total + f_size_total)}[/bold]")
     return Panel(table, title="📊 План выполнения", border_style="yellow")
 
+# Замените эту функцию целиком
 def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
+    """Генерирует панель со статусом дисков."""
     table = Table(box=None, expand=True)
     table.add_column("Диск", style="white", no_wrap=True)
     table.add_column("Заполнено", style="green", ratio=1)
     table.add_column("%", style="bold", justify="right")
+
     for mount, percent in disk_manager.get_all_disks_status():
         color = "green" if percent < config['threshold'] else "red"
-        bar = Progress(BarColumn(bar_width=None), style=color, complete_style=color)
+
+        # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+        # Стили `style` и `complete_style` передаются в BarColumn, а не в Progress
+        bar = Progress(
+            BarColumn(
+                bar_width=None,
+                style=color,
+                complete_style=color
+            )
+        )
+        # ------------------------
+
         bar.add_task("d", total=100, completed=percent)
         is_active = " (*)" if mount == disk_manager.active_disk else ""
         table.add_row(f"[bold]{mount}{is_active}[/bold]", bar, f"{percent:.1f}%")
+
     return Panel(table, title="📦 Диски", border_style="blue")
 
 def generate_workers_panel(threads) -> Panel:
