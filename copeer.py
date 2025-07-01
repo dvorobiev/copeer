@@ -2,25 +2,14 @@
 """
 Утилита для архивации и параллельного копирования больших объемов данных
 с TUI-дашбордом на базе Rich и возможностью возобновления работы.
-
-Основные возможности:
-- Анализ входного CSV-файла с манифестом файлов.
-- Автоматическая группировка файловых секвенций и их архивация "на лету".
-- Многопоточное копирование и архивация.
-- Интерактивный TUI с живым отображением прогресса для rsync.
-- Последовательное заполнение дисков с контролем порога.
-- Надежное возобновление работы после прерывания.
-- Гибкая настройка через config.yaml.
 """
 
 # Стандартная библиотека
 import argparse
 import csv
-import fcntl  # Unix-only
 import logging
 import os
 import re
-import select  # Unix-only
 import subprocess
 import sys
 import tarfile
@@ -30,6 +19,14 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock, get_ident
+
+# Импорты для Unix-систем (для живого прогресса rsync)
+try:
+    import fcntl
+    import select
+    UNIX_SYSTEM = True
+except ImportError:
+    UNIX_SYSTEM = False
 
 # Сторонние библиотеки
 from rich.console import Console
@@ -45,7 +42,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "2.4.0"
+__version__ = "3.0.0"  # Финальная стабильная версия
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
     'mount_points': ["/mnt/disk1", "/mnt/disk2"],
@@ -57,17 +54,16 @@ DEFAULT_CONFIG = {
     'error_log_file': "errors.log",
     'dry_run_mapping_file': "dry_run_mapping.csv",
     'dry_run': False,
-    'progress_mode': 'simple',
     'threads': 8,
     'min_files_for_sequence': 50,
-    'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c']
+    'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
+    'progress_mode': 'advanced' if UNIX_SYSTEM else 'simple' # 'simple' или 'advanced'
 }
 SEQUENCE_RE = re.compile(r'^(.*?)[\._]*(\d+)\.([a-zA-Z0-9]+)$', re.IGNORECASE)
 
 logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler(rich_tracebacks=True, show_path=False, console=console)])
 log = logging.getLogger("rich")
 
-processed_items_keys = set()
 file_lock = Lock()
 worker_stats = defaultdict(lambda: {"status": "[grey50]Ожидание...[/grey50]", "speed": "", "progress": None})
 
@@ -137,11 +133,13 @@ def load_config():
     config['image_extensions'] = set(e.lower() for e in config.get('image_extensions', []))
     return config
 
-def load_previous_state(state_file):
+def load_previous_state(state_file, processed_items_keys):
     """Загружает ключи уже обработанных элементов для возобновления работы."""
     if os.path.exists(state_file):
         try:
-            with open(state_file, 'r', encoding='utf-8') as f: processed_items_keys.update(row[0] for row in csv.reader(f) if row)
+            with open(state_file, 'r', encoding='utf-8') as f:
+                for row in csv.reader(f):
+                    if row: processed_items_keys.add(row[0])
             log.info(f"Загружено [bold]{len(processed_items_keys)}[/bold] записей из файла состояния.")
         except Exception as e: log.error(f"Не удалось прочитать файл состояния {state_file}: {e}")
 
@@ -160,12 +158,12 @@ def find_sequences(dirs, config):
         sequences_in_dir = defaultdict(list)
         for filename, file_size in files_with_sizes:
             match = SEQUENCE_RE.match(filename)
-            if match and match.group(3).lower() in config['image_extensions']:
+            if match and match.group(3).lower() in config.get('image_extensions', set()):
                 prefix, frame, ext = match.groups()
                 full_path = os.path.join(dir_path, filename)
                 sequences_in_dir[(prefix, ext.lower())].append((int(frame), full_path, file_size))
         for (prefix, ext), file_tuples in sequences_in_dir.items():
-            if len(file_tuples) >= config['min_files_for_sequence']:
+            if len(file_tuples) >= config.get('min_files_for_sequence', 50):
                 file_tuples.sort()
                 frames, full_paths, sizes = zip(*file_tuples)
                 min_frame, max_frame = min(frames), max(frames)
@@ -193,14 +191,13 @@ def archive_sequence_to_destination(job, dest_tar_path):
 
 # --- Логика анализа и выполнения ---
 
-def analyze_and_plan_jobs(input_csv_path, config):
+def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
     """
     Анализирует CSV, используя иерархию парсеров, выводит отчет и ждет подтверждения.
     """
     console.rule("[yellow]Шаг 1: Анализ и планирование[/]")
     console.print(f"Анализ файла: [bold cyan]{input_csv_path}[/bold cyan]")
 
-    # Парсеры для разных форматов строк
     parser_primary = re.compile(r'^"([^"]+)","([^"]+)",.*')
     parser_fallback = re.compile(r'^"([^"]+\.\w{2,5})",.*', re.IGNORECASE)
 
@@ -212,8 +209,7 @@ def analyze_and_plan_jobs(input_csv_path, config):
     lines_total, lines_ignored_dirs, malformed_lines = 0, 0, []
 
     try:
-        with open(input_csv_path, 'r', encoding='utf-8', errors='ignore') as f:
-            total_lines_for_progress = sum(1 for _ in f)
+        with open(input_csv_path, 'r', encoding='utf-8', errors='ignore') as f: total_lines_for_progress = sum(1 for _ in f)
 
         with Progress(console=console) as progress:
             task = progress.add_task("[green]Анализ CSV...", total=total_lines_for_progress)
@@ -252,19 +248,15 @@ def analyze_and_plan_jobs(input_csv_path, config):
                     else:
                         malformed_lines.append((lines_total, line, "Неизвестный формат строки"))
 
-    except (KeyboardInterrupt, SystemExit):
-        console.print("\n[yellow]Анализ прерван пользователем.[/yellow]")
-        sys.exit(0)
+    except (KeyboardInterrupt, SystemExit): console.print("\n[yellow]Анализ прерван пользователем.[/yellow]"); sys.exit(0)
     except FileNotFoundError: console.print(f"[bold red]Критическая ошибка: CSV-файл не найден: {input_csv_path}[/]"); sys.exit(1)
     except Exception as e: console.print(f"[bold red]Критическая ошибка при чтении CSV: {e}[/]"); sys.exit(1)
 
     if not all_files_from_csv:
-        # ... обработка ошибок и отчеты ...
         if malformed_lines:
             console.print("\n[bold red]Не найдено ни одного корректного файла. Обнаружены следующие проблемы:[/bold red]")
             for num, err_line, reason in malformed_lines[:50]: console.print(f"[dim]Строка #{num} ({reason}):[/dim] {err_line}")
-        else:
-            log.warning("В CSV не найдено ни одного файла для обработки.")
+        else: log.warning("В CSV не найдено ни одного файла для обработки.")
         sys.exit(0)
 
     sequences, sequence_files = find_sequences(dirs, config)
@@ -281,7 +273,6 @@ def analyze_and_plan_jobs(input_csv_path, config):
     seq_jobs = [j for j in jobs_to_process if j['type'] == 'sequence']
     file_jobs = [j for j in jobs_to_process if j['type'] == 'file']
 
-    # Цикл с меню выбора
     while True:
         console.rule("[yellow]Отчет по анализу[/]")
         report_table = Table(title=None, show_header=False, box=None, padding=(0, 2))
@@ -329,20 +320,16 @@ def analyze_and_plan_jobs(input_csv_path, config):
     return jobs_to_process, plan_summary
 
 
-# Замените эту функцию целиком
 def process_job_worker(job, config, disk_manager):
-    """
-    Обрабатывает одно задание, используя единый неблокирующий подход для всех режимов.
-    Гарантирует отзывчивость TUI, показывая текущую задачу.
-    """
+    """Обрабатывает одно задание, используя надежный подход для TUI."""
     thread_id = get_ident()
+    progress_mode = config.get('progress_mode', 'simple')
     is_dry_run = config['dry_run']
 
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
 
-    # Устанавливаем начальный статус, который будет виден в TUI
-    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": None}
+    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0 if progress_mode == 'advanced' else None}
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
@@ -358,59 +345,64 @@ def process_job_worker(job, config, disk_manager):
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
 
         if job['type'] == 'sequence':
-            # Архивация обычно быстрая, просто выполняем
             if not is_dry_run:
-                if not archive_sequence_to_destination(job, dest_path):
-                    raise RuntimeError(f"Не удалось создать архив {short_name}")
-            else:
-                time.sleep(0.05) # Имитация работы для dry-run
+                if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
+            else: time.sleep(0.01)
             source_keys_to_log = job['source_files']
-
         else: # 'file'
-            # Копирование может быть долгим, используем неблокирующий Popen
             source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
-                if not os.path.exists(absolute_source_key):
-                    raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
+                if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                # --- ИЗМЕНЕНИЕ: Единый подход через Popen ---
-                rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
-
-                # Запускаем rsync и немедленно продолжаем, не блокируя поток
-                process = subprocess.Popen(rsync_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-                # Просто ждем завершения в цикле, позволяя TUI обновляться
-                while process.poll() is None:
-                    time.sleep(0.2) # Небольшая пауза, чтобы не нагружать CPU
-
-                # Проверяем код возврата после завершения
-                if process.returncode != 0:
-                    stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
-                    raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=stderr_output)
-            else:
-                time.sleep(0.05) # Имитация работы для dry-run
+                if progress_mode == 'advanced' and UNIX_SYSTEM:
+                    rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
+                    process = subprocess.Popen(
+                        rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, bufsize=1, universal_newlines=True, encoding='utf-8', errors='replace'
+                    )
+                    fd = process.stdout.fileno()
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                    progress_re = re.compile(r'\s*[\d,.]+[KMGT]?\s+(\d+)%\s+([\d.]+\w+/s)')
+                    while process.poll() is None:
+                        try:
+                            chunk = process.stdout.read()
+                            if chunk:
+                                last_update = chunk.strip().split('\r')[-1]
+                                match = progress_re.search(last_update)
+                                if match:
+                                    percent, speed = match.groups()
+                                    worker_stats[thread_id]['progress'] = int(percent)
+                                    worker_stats[thread_id]['speed'] = speed
+                        except (IOError, TypeError): time.sleep(0.1)
+                    if process.returncode != 0 and process.returncode != 20:
+                        raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
+                else: # 'simple' mode
+                    rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
+                    subprocess.run(rsync_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else: # dry_run
+                time.sleep(0.05)
 
         worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
-        return source_keys_to_log, dest_path, job['size'], job['type']
+        return (job['type'], job['size'], source_keys_to_log, dest_path)
 
     except Exception as e:
         if not isinstance(e, KeyboardInterrupt):
             worker_stats[thread_id] = {"status": f"[red]Ошибка:[/] {short_name}", "speed": "ERROR", "progress": None}
             log.error(f"Ошибка при обработке {job['key']}: {e}")
-            with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
-        return None, None, 0, job['type']
+            with file_lock:
+                 with open(config['error_log_file'], "a", encoding='utf-8') as f:
+                    f.write(f"{time.asctime()};{job['key']};{e}\n")
+        return (None, 0, None, None)
+
 
 # --- Функции для отрисовки TUI ---
 
 def make_layout() -> Layout:
     """Определяет структуру TUI."""
     layout = Layout(name="root")
-    layout.split_column(
-        Layout(name="top", ratio=1),
-        Layout(name="middle"),
-        Layout(name="bottom", size=3)
-    )
+    layout.split_column(Layout(name="top", size=5), Layout(name="middle"), Layout(name="bottom", size=3))
     layout["top"].split_row(Layout(name="summary"), Layout(name="disks"))
     return layout
 
@@ -418,16 +410,16 @@ def generate_summary_panel(plan, completed) -> Panel:
     """Генерирует панель сводки с динамическим прогрессом."""
     table = Table(box=None, expand=True)
     table.add_column("Тип задания", style="cyan", no_wrap=True)
-    table.add_column("Выполнено (шт)", style="green", justify="right")
+    table.add_column("Выполнено", style="green", justify="right")
     table.add_column("Размер", style="green", justify="right")
 
     s_done, s_total = completed['sequence']['count'], plan['sequences']['count']
     s_size_done, s_size_total = completed['sequence']['size'], plan['sequences']['size']
-    table.add_row("Архивация секвенций", f"{s_done} / {s_total}", f"{decimal(s_size_done)} / {decimal(s_size_total)}")
+    table.add_row("Архивация", f"{s_done} / {s_total}", f"{decimal(s_size_done)} / {decimal(s_size_total)}")
 
     f_done, f_total = completed['files']['count'], plan['files']['count']
     f_size_done, f_size_total = completed['files']['size'], plan['files']['size']
-    table.add_row("Копирование файлов", f"{f_done} / {f_total}", f"{decimal(f_size_done)} / {decimal(f_size_total)}")
+    table.add_row("Копирование", f"{f_done} / {f_total}", f"{decimal(f_size_done)} / {decimal(f_size_total)}")
 
     table.add_row("[bold]Всего[/bold]", f"[bold]{s_done + f_done} / {s_total + f_total}[/bold]", f"[bold]{decimal(s_size_done + f_size_done)} / {decimal(s_size_total + f_size_total)}[/bold]")
     return Panel(table, title="📊 План выполнения", border_style="yellow")
@@ -441,7 +433,7 @@ def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
     for mount, percent in disk_manager.get_all_disks_status():
         color = "green" if percent < config['threshold'] else "red"
         bar = Progress(BarColumn(bar_width=None, style=color, complete_style=color), expand=True)
-        task_id = bar.add_task("d", total=100); bar.update(task_id, completed=percent)
+        task_id = bar.add_task("d", total=100, completed=percent)
         is_active = " (*)" if mount == disk_manager.active_disk else ""
         table.add_row(f"[bold]{mount}{is_active}[/bold]", bar, f"{percent:.1f}%")
     return Panel(table, title="📦 Диски", border_style="blue")
@@ -474,16 +466,12 @@ def generate_workers_panel(threads) -> Panel:
 
 # --- Точка входа ---
 
-# Замените эту функцию целиком
-# Замените эту функцию целиком
-# Замените эту функцию целиком
-# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Smart Archiver & Copier v2.4.3[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Smart Archiver & Copier v{__version__}[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -494,9 +482,10 @@ def main(args):
             console.print(f"Отчет dry-run будет сохранен в: [cyan]{dry_run_log_path}[/cyan]")
         except IOError as e: console.print(f"[bold red]Не удалось создать файл отчета для dry-run: {e}[/bold red]")
 
-    load_previous_state(config['state_file'])
+    processed_items_keys = set()
+    load_previous_state(config['state_file'], processed_items_keys)
 
-    jobs_to_process, plan_summary = analyze_and_plan_jobs(args.input_file, config)
+    jobs_to_process, plan_summary = analyze_and_plan_jobs(args.input_file, config, processed_items_keys)
     if not jobs_to_process: return
 
     if not is_dry_run:
@@ -522,63 +511,39 @@ def main(args):
     layout = make_layout()
     layout["bottom"].update(Panel(progress, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
 
-    global completed_stats, jobs_completed_count, all_jobs_successful
     completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
-    jobs_completed_count = 0
-    all_jobs_successful = True
-    stats_lock = Lock()
-
-    # --- ИЗМЕНЕНИЕ: Правильная потокобезопасная обертка ---
-    def job_wrapper(job):
-        global completed_stats, jobs_completed_count, all_jobs_successful
-
-        # Этот вызов теперь полностью самодостаточен и не требует обертки
-        source_keys, dest_path, size_processed, job_type = process_job_worker(job, config, disk_manager)
-
-        # Запись в лог-файлы происходит внутри process_job_worker под своим локом
-        if source_keys is not None:
-             # Логирование происходит уже внутри воркера, здесь только обновляем статистику
-            state_log = config['state_file']
-            mapping_log = config['dry_run_mapping_file'] if is_dry_run else config['mapping_file']
-            for key in source_keys:
-                write_log(state_log, mapping_log, key, dest_path, is_dry_run=is_dry_run)
-
-        # Обновляем общую статистику под отдельным локом
-        with stats_lock:
-            if source_keys is not None:
-                if job_type == 'sequence':
-                    completed_stats['sequence']['count'] += 1
-                    completed_stats['sequence']['size'] += size_processed
-                else:
-                    completed_stats['files']['count'] += 1
-                    completed_stats['files']['size'] += size_processed
-            else:
-                all_jobs_successful = False
-
-            jobs_completed_count += 1
-            progress.update(main_task, advance=1)
-            job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+    jobs_completed_count, all_jobs_successful = 0, True
 
     try:
-        with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible") as live:
+        with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
-                for job in jobs_to_process:
-                    executor.submit(job_wrapper, job)
+                future_to_job = {executor.submit(process_job_worker, job, config, disk_manager): job for job in jobs_to_process}
 
-                while jobs_completed_count < len(jobs_to_process):
-                    with stats_lock:
-                        layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+                for future in as_completed(future_to_job):
+                    job_type, size_processed, source_keys, dest_path = future.result()
 
+                    if job_type:
+                        for key in source_keys:
+                            write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
+
+                        if job_type == 'sequence':
+                            completed_stats['sequence']['count'] += 1
+                            completed_stats['sequence']['size'] += size_processed
+                        else:
+                            completed_stats['files']['count'] += 1
+                            completed_stats['files']['size'] += size_processed
+                    else:
+                        all_jobs_successful = False
+
+                    jobs_completed_count += 1
+                    progress.update(main_task, advance=1)
+                    job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+
+                    # Обновляем панели после обработки результата
+                    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
                     if not is_dry_run:
                         layout["disks"].update(generate_disks_panel(disk_manager, config))
-
                     layout["middle"].update(generate_workers_panel(config['threads']))
-
-                    time.sleep(0.5)
-
-            # Финальное обновление
-            layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-            layout["middle"].update(generate_workers_panel(config['threads']))
 
     except (KeyboardInterrupt, SystemExit):
         console.print("\n[bold red]Процесс прерван. В реальном режиме состояние сохранено.[/bold red]")
@@ -602,7 +567,5 @@ if __name__ == "__main__":
     )
     parser.add_argument("input_file", help="Путь к CSV файлу со списком исходных файлов.")
     parser.add_argument("--dry-run", action="store_true", help="Выполнить анализ без реального копирования.")
-    # Убираем source_base, т.к. теперь все в конфиге
-    # parser.add_argument("--source-base", help="Базовый путь для относительных путей из CSV.")
     args = parser.parse_args()
     main(args)
