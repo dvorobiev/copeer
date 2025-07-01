@@ -430,12 +430,14 @@ def generate_workers_panel(threads) -> Panel:
 
 # --- Точка входа ---
 
+# Замените эту функцию целиком
 def main(args):
     """Главная функция скрипта."""
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    console.rule(f"[bold]Copeer v{__version__}[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    # Поднимаем версию за этот критический фикс
+    console.rule(f"[bold]Copeer v3.0.1[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -452,26 +454,33 @@ def main(args):
     jobs_to_process, plan_summary = analyze_and_plan_jobs(args.input_file, config, processed_items_keys)
     if not jobs_to_process: return
 
-    disk_manager = DiskManager(config['mount_points'], config['threshold']) if not is_dry_run else type('FakeDisk', (), {'get_current_destination': lambda: "/dry/run/dest", 'get_all_disks_status': lambda: [(p, 0.0) for p in config['mount_points']]})()
+    disk_manager = DiskManager(config['mount_points'], config['threshold']) if not is_dry_run else type('FakeDisk', (), {'active_disk': config['mount_points'][0] if config['mount_points'] else "/dry/run/dest", 'get_current_destination': lambda self: self.active_disk, 'get_all_disks_status': lambda self: [(p, 0.0) for p in config['mount_points']]})()
     if not is_dry_run and not disk_manager.active_disk: return
 
     console.rule("[yellow]Шаг 2: Выполнение[/]")
     time.sleep(1)
 
-    completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
-    jobs_completed_count, all_jobs_successful, total_bytes_processed = 0, True, 0
-    total_time_start = time.monotonic()
-
-    # Инициализация TUI
+    # --- ИЗМЕНЕНИЕ: Собираем ВЕСЬ интерфейс ДО запуска Live ---
     layout = make_layout()
-    speed_column = TransferSpeedColumn()
+
+    # Создаем все компоненты
+    completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
+
+    job_counter_column = TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]")
     progress_bar = Progress(TextColumn("[bold blue]Общий прогресс:[/bold blue]"), BarColumn(), TaskProgressColumn(), TextColumn("•"),
-                            TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]", "job_counter"), TextColumn("•"),
-                            speed_column, TextColumn("•"), TimeRemainingColumn())
-    main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['size'])
+                            job_counter_column, TextColumn("•"), TransferSpeedColumn(), TextColumn("•"), TimeRemainingColumn())
+    main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['count'])
+
+    # Предварительно заполняем все слои layout'а
+    layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
+    layout["disks"].update(generate_disks_panel(disk_manager, config))
+    layout["middle"].update(generate_workers_panel(config['threads']))
     layout["bottom"].update(Panel(progress_bar, title="🚀 Процесс выполнения", border_style="magenta", expand=False))
 
+    jobs_completed_count, all_jobs_successful = 0, True
+
     try:
+        # Теперь передаем в Live полностью готовый layout
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
 
@@ -481,35 +490,40 @@ def main(args):
                     job_type, size_processed, source_keys, dest_path = future.result()
 
                     if job_type:
-                        for key in source_keys: write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
+                        for key in source_keys:
+                            write_log(config['state_file'], config['mapping_file'], key, dest_path, is_dry_run)
+
                         if job_type == 'sequence':
                             completed_stats['sequence']['count'] += 1; completed_stats['sequence']['size'] += size_processed
                         else:
                             completed_stats['files']['count'] += 1; completed_stats['files']['size'] += size_processed
-                        total_bytes_processed += size_processed
                     else:
                         all_jobs_successful = False
 
                     jobs_completed_count += 1
-                    progress_bar.update(main_task, advance=size_processed)
-                    progress_bar.columns[4].text = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
+                    progress_bar.update(main_task, advance=1)
+                    job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
 
+                    # В цикле мы только ОБНОВЛЯЕМ панели, а не создаем их
                     layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
-                    if not is_dry_run: layout["disks"].update(generate_disks_panel(disk_manager, config))
+                    if not is_dry_run:
+                        layout["disks"].update(generate_disks_panel(disk_manager, config))
                     layout["middle"].update(generate_workers_panel(config['threads']))
 
     except (KeyboardInterrupt, SystemExit):
         console.print("\n[bold red]Процесс прерван.[/bold red]")
         sys.exit(1)
 
-    total_duration = time.monotonic() - total_time_start
+    total_duration = time.monotonic() - (live.start_time if 'live' in locals() else time.monotonic())
+    total_bytes_processed = completed_stats['sequence']['size'] + completed_stats['files']['size']
     final_avg_speed = total_bytes_processed / total_duration if total_duration > 0 else 0
 
-    console.rule(f"[bold {'green' if all_jobs_successful else 'yellow'}]✅ Выполнение завершено[/bold {'green' if all_jobs_successful else 'yellow'}]")
+    console.rule(f"[bold {'green' if all_jobs_successful else 'yellow'}]Выполнение завершено[/bold {'green' if all_jobs_successful else 'yellow'}]")
     console.print(f"  Общее время выполнения: {time.strftime('%H:%M:%S', time.gmtime(total_duration))}")
     console.print(f"  Всего обработано данных: {decimal(total_bytes_processed)}")
     console.print(f"  Средняя скорость: [bold magenta]{decimal(final_avg_speed)}/s[/bold magenta]")
-    if not all_jobs_successful: console.print("[yellow]В процессе работы были ошибки. Проверьте лог.[/yellow]")
+    if not all_jobs_successful:
+        console.print("[yellow]В процессе работы были ошибки. Проверьте лог.[/yellow]")
 
 
 if __name__ == "__main__":
