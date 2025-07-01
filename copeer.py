@@ -45,7 +45,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "2.3.1" # Финальная версия после всех правок
+__version__ = "2.4.0"
 CONFIG_FILE = "config.yaml"
 DEFAULT_CONFIG = {
     'mount_points': ["/mnt/disk1", "/mnt/disk2"],
@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
     'error_log_file': "errors.log",
     'dry_run_mapping_file': "dry_run_mapping.csv",
     'dry_run': False,
+    'progress_mode': 'simple',
     'threads': 8,
     'min_files_for_sequence': 50,
     'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c']
@@ -330,15 +331,19 @@ def analyze_and_plan_jobs(input_csv_path, config):
 
 def process_job_worker(job, config, disk_manager):
     """
-    Обрабатывает одно задание, используя неблокирующее чтение fcntl
-    для гарантированного получения прогресса rsync в реальном времени.
+    Обрабатывает одно задание с двумя режимами отображения прогресса:
+    - 'simple': (по умолчанию) Просто показывает имя файла. Надежно.
+    - 'advanced': Пытается показать живой прогресс rsync (может не работать).
     """
     thread_id = get_ident()
+    progress_mode = config.get('progress_mode', 'simple')
     is_dry_run = config['dry_run']
+
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     status_text = f"[yellow]Архивирую:[/] {short_name}" if job['type'] == 'sequence' else f"[cyan]Копирую:[/] {short_name}"
 
-    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": 0}
+    # Устанавливаем начальный статус, который будет виден в любом режиме
+    worker_stats[thread_id] = {"status": status_text, "speed": "", "progress": None}
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
@@ -355,8 +360,7 @@ def process_job_worker(job, config, disk_manager):
 
         if job['type'] == 'sequence':
             if not is_dry_run:
-                for f in job['source_files']:
-                    if not os.path.exists(f): raise FileNotFoundError(f"Исходный файл секвенции не найден: {f}")
+                # Архивация быстрая, живой прогресс не нужен
                 if not archive_sequence_to_destination(job, dest_path): raise RuntimeError(f"Не удалось создать архив {short_name}")
             else: time.sleep(0.01)
             source_keys_to_log = job['source_files']
@@ -367,52 +371,44 @@ def process_job_worker(job, config, disk_manager):
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
-                # Команда с флагами, которые заставляют rsync отдавать прогресс построчно
-                rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
-
-                process = subprocess.Popen(
-                    rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding='utf-8', errors='replace'
-                )
-
-                # --- ИЗМЕНЕНИЕ: Канонический способ неблокирующего чтения в Unix ---
-                # 1. Получаем файловый дескриптор stdout процесса
-                fd = process.stdout.fileno()
-                # 2. Устанавливаем флаг O_NONBLOCK, чтобы чтение не блокировалось
-                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-                # Улучшенный regex
-                progress_re = re.compile(r'\s*[\d,.]+[KMGT]?\s+(\d+)%\s+([\d.]+\w+/s)')
-                line_buffer = ""
-
-                while process.poll() is None:
-                    try:
-                        # 3. Пытаемся прочитать данные. Если их нет, будет IOError.
-                        chunk = process.stdout.read()
-                        if chunk:
-                            line_buffer += chunk
-                            # Обрабатываем все полные строки, которые могли накопиться
-                            lines = line_buffer.split('\r')
-                            # Последняя часть может быть неполной, сохраняем ее обратно в буфер
-                            line_buffer = lines.pop()
-                            for line in lines:
-                                match = progress_re.search(line)
+                # --- ЛОГИКА В ЗАВИСИМОСТИ ОТ РЕЖИМА ---
+                if progress_mode == 'advanced':
+                    # --- РЕЖИM 'ADVANCED' (может не работать) ---
+                    rsync_cmd = ["rsync", "-a", "--checksum", "--info=progress2", "--no-i-r", "--outbuf=L", absolute_source_key, dest_path]
+                    process = subprocess.Popen(
+                        rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, bufsize=1, universal_newlines=True,
+                        encoding='utf-8', errors='replace'
+                    )
+                    fd = process.stdout.fileno()
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                    progress_re = re.compile(r'\s*[\d,.]+[KMGT]?\s+(\d+)%\s+([\d.]+\w+/s)')
+                    while process.poll() is None:
+                        try:
+                            chunk = process.stdout.read()
+                            if chunk:
+                                last_update = chunk.strip().split('\r')[-1]
+                                match = progress_re.search(last_update)
                                 if match:
                                     percent, speed = match.groups()
                                     worker_stats[thread_id]['progress'] = int(percent)
                                     worker_stats[thread_id]['speed'] = speed
-                    except (IOError, TypeError):
-                        # Ошибки ожидаемы, если данных для чтения пока нет. Просто ждем.
-                        time.sleep(0.1)
+                        except (IOError, TypeError):
+                            time.sleep(0.1)
+                else:
+                    # --- РЕЖИМ 'SIMPLE' (надежный) ---
+                    # Просто запускаем и ждем завершения. Статус уже установлен.
+                    rsync_cmd = ["rsync", "-a", "--checksum", absolute_source_key, dest_path]
+                    subprocess.run(rsync_cmd, check=True, capture_output=True)
 
-                # Проверяем код возврата после завершения
-                if process.returncode != 0 and process.returncode != 20: # 20 = прерывание
-                    raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
-            else:
-                # Имитация для dry-run
-                for p in range(0, 101, 10):
-                    worker_stats[thread_id]['progress'] = p; time.sleep(0.05)
+                # Проверяем код возврата для обоих режимов
+                if 'process' in locals() and process.poll() is not None:
+                     if process.returncode != 0 and process.returncode != 20:
+                        raise subprocess.CalledProcessError(process.returncode, rsync_cmd, stderr=process.stderr.read())
+
+            else: # dry_run
+                time.sleep(0.05)
 
         worker_stats[thread_id] = {"status": "[green]Свободен[/green]", "speed": "", "progress": None}
         return source_keys_to_log, dest_path, job['size'], job['type']
@@ -423,7 +419,6 @@ def process_job_worker(job, config, disk_manager):
             log.error(f"Ошибка при обработке {job['key']}: {e}")
             with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
         return None, None, 0, job['type']
-
 
 # --- Функции для отрисовки TUI ---
 
