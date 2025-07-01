@@ -451,8 +451,7 @@ def main(args):
     config = load_config()
     if args.dry_run: config['dry_run'] = True
 
-    # Поднимаем версию за этот критический фикс
-    console.rule(f"[bold]Copeer v3.0.1[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
+    console.rule(f"[bold]Copeer v3.0.2[/bold] | Режим: {'Dry Run' if config['dry_run'] else 'Реальная работа'}")
 
     is_dry_run = config['dry_run']
     if is_dry_run:
@@ -475,10 +474,7 @@ def main(args):
     console.rule("[yellow]Шаг 2: Выполнение[/]")
     time.sleep(1)
 
-    # --- ИЗМЕНЕНИЕ: Собираем ВЕСЬ интерфейс ДО запуска Live ---
     layout = make_layout()
-
-    # Создаем все компоненты
     completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
 
     job_counter_column = TextColumn(f"[cyan]0/{plan_summary['total']['count']} заданий[/cyan]")
@@ -486,7 +482,6 @@ def main(args):
                             job_counter_column, TextColumn("•"), TransferSpeedColumn(), TextColumn("•"), TimeRemainingColumn())
     main_task = progress_bar.add_task("выполнение", total=plan_summary['total']['count'])
 
-    # Предварительно заполняем все слои layout'а
     layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
     layout["disks"].update(generate_disks_panel(disk_manager, config))
     layout["middle"].update(generate_workers_panel(config['threads']))
@@ -494,8 +489,10 @@ def main(args):
 
     jobs_completed_count, all_jobs_successful = 0, True
 
+    # --- ИСПРАВЛЕНИЕ: Засекаем время старта здесь ---
+    execution_start_time = time.monotonic()
+
     try:
-        # Теперь передаем в Live полностью готовый layout
         with Live(layout, screen=True, redirect_stderr=False, vertical_overflow="visible", refresh_per_second=4) as live:
             with ThreadPoolExecutor(max_workers=config['threads']) as executor:
 
@@ -519,7 +516,6 @@ def main(args):
                     progress_bar.update(main_task, advance=1)
                     job_counter_column.text_format = f"[cyan]{jobs_completed_count}/{plan_summary['total']['count']} заданий[/cyan]"
 
-                    # В цикле мы только ОБНОВЛЯЕМ панели, а не создаем их
                     layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
                     if not is_dry_run:
                         layout["disks"].update(generate_disks_panel(disk_manager, config))
@@ -529,7 +525,8 @@ def main(args):
         console.print("\n[bold red]Процесс прерван.[/bold red]")
         sys.exit(1)
 
-    total_duration = time.monotonic() - (live.start_time if 'live' in locals() else time.monotonic())
+    # --- ИСПРАВЛЕНИЕ: Используем нашу переменную для расчета времени ---
+    total_duration = time.monotonic() - execution_start_time
     total_bytes_processed = completed_stats['sequence']['size'] + completed_stats['files']['size']
     final_avg_speed = total_bytes_processed / total_duration if total_duration > 0 else 0
 
