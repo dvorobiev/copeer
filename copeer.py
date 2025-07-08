@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     'error_log_file': "errors.log",
     'dry_run_mapping_file': "dry_run_mapping.csv",
     'threads': 8,
+    'disk_strategy: round_robin', #or fill
     'min_files_for_sequence': 50,
     'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
 }
@@ -53,40 +54,72 @@ worker_stats = {}
 # --- Основные классы ---
 
 class DiskManager:
-    """Управляет выбором диска для записи."""
-    def __init__(self, mount_points, threshold):
-        self.mount_points, self.threshold, self.active_disk, self.lock = mount_points, threshold, None, Lock()
+    """
+    Управляет выбором диска для записи, поддерживая две стратегии:
+    - 'fill': Заполнять один диск, затем переходить к следующему.
+    - 'round_robin': Распределять задания по дискам по кругу.
+    """
+    def __init__(self, mount_points, threshold, strategy='fill'):
+        self.mount_points = mount_points
+        self.threshold = threshold
+        self.strategy = strategy
+        self.active_disk = None  # Для стратегии 'fill'
+        self.next_disk_index = 0 # Для стратегии 'round_robin'
+        self.lock = Lock()
+
+        log.info(f"Стратегия распределения по дискам: [bold cyan]{self.strategy}[/bold cyan]")
         self._select_initial_disk()
 
     def _get_disk_usage(self, path):
-        if not os.path.exists(path): return 0.0
+        if not os.path.exists(path): return 100.0 # Считаем недоступный диск полным
         try:
-            st = os.statvfs(path); used = (st.f_blocks - st.f_bfree) * st.f_frsize; total = st.f_blocks * st.f_frsize
-            return round(used / total * 100, 2) if total > 0 else 0
-        except FileNotFoundError: return 100
+            st = os.statvfs(path)
+            used = (st.f_blocks - st.f_bfree) * st.f_frsize
+            total = st.f_blocks * st.f_frsize
+            return round(used / total * 100, 2) if total > 0 else 0.0
+        except FileNotFoundError:
+            return 100.0
 
     def _select_initial_disk(self):
+        # Эта функция нужна в основном для стратегии 'fill' и для первоначальной проверки
         for mount in self.mount_points:
             if not os.path.exists(mount):
-                log.warning(f"Точка монтирования [bold yellow]{mount}[/bold yellow] не существует. Пропускаю."); continue
+                log.warning(f"Точка монтирования [bold yellow]{mount}[/bold yellow] не существует. Пропускаю.")
+                continue
             if self._get_disk_usage(mount) < self.threshold:
-                self.active_disk = mount; log.info(f"Выбран начальный диск: [bold green]{self.active_disk}[/bold green]"); return
-        log.error("🛑 Не найдено подходящих дисков для начала работы."); raise RuntimeError("Не найдено подходящих дисков")
+                self.active_disk = mount
+                log.info(f"Найден как минимум один доступный диск для начала работы: [bold green]{self.active_disk}[/bold green]")
+                return
+        log.error("🛑 Не найдено подходящих дисков для начала работы.")
+        raise RuntimeError("Не найдено подходящих дисков")
 
     def get_current_destination(self):
-        with self.lock:
-            if not self.active_disk: raise RuntimeError("🛑 Нет доступных дисков.")
-            if self._get_disk_usage(self.active_disk) >= self.threshold:
-                log.warning(f"Диск [bold]{self.active_disk}[/bold] заполнен. Ищу следующий...")
-                available_disks = [m for m in self.mount_points if os.path.exists(m)]
-                try:
-                    current_index = available_disks.index(self.active_disk)
-                    next_disks = available_disks[current_index + 1:] + available_disks[:current_index]
-                except (ValueError, IndexError): next_disks = available_disks
-                self.active_disk = next((m for m in next_disks if self._get_disk_usage(m) < self.threshold), None)
-                if self.active_disk: log.info(f"Переключился на диск: [bold green]{self.active_disk}[/bold green]")
-            if not self.active_disk: raise RuntimeError("🛑 Нет доступных дисков: все переполнены или недоступны.")
-            return self.active_disk
+        """Возвращает путь к целевому диску в зависимости от выбранной стратегии."""
+        with self.lock: # Блокировка необходима, т.к. несколько потоков будут вызывать этот метод
+
+            # 1. Получаем список всех дисков, на которые еще можно писать
+            usable_disks = [m for m in self.mount_points if os.path.exists(m) and self._get_disk_usage(m) < self.threshold]
+
+            if not usable_disks:
+                raise RuntimeError("🛑 Нет доступных дисков: все переполнены или недоступны.")
+
+            # 2. Выбираем диск в зависимости от стратегии
+            if self.strategy == 'round_robin':
+                # --- ЛОГИКА 'ROUND_ROBIN' ---
+                if self.next_disk_index >= len(usable_disks):
+                    self.next_disk_index = 0 # Сбрасываем индекс, если список дисков сократился
+
+                selected_disk = usable_disks[self.next_disk_index]
+                # Передвигаем указатель на следующий диск для следующего вызова
+                self.next_disk_index = (self.next_disk_index + 1) % len(usable_disks)
+                return selected_disk
+
+            else: # --- ЛОГИКА 'FILL' (старое поведение) ---
+                if self.active_disk not in usable_disks:
+                    log.warning(f"Диск [bold]{self.active_disk}[/bold] заполнен или недоступен. Ищу следующий...")
+                    self.active_disk = usable_disks[0] # Просто берем первый доступный
+                    log.info(f"Переключился на диск: [bold green]{self.active_disk}[/bold green]")
+                return self.active_disk
 
     def get_all_disks_status(self):
         return [(m, self._get_disk_usage(m)) for m in self.mount_points]
@@ -476,7 +509,7 @@ def main(args):
     if not show_summary_and_confirm(copy_jobs, archive_jobs, stats):
         console.print("[yellow]Выполнение отменено пользователем.[/yellow]"); sys.exit(0)
 
-    disk_manager = DiskManager(config['mount_points'], config['threshold']) if not is_dry_run else type('FakeDisk', (), {'active_disk': config['mount_points'][0] if config['mount_points'] else "/dry/run/dest", 'get_current_destination': lambda self: self.active_disk, 'get_all_disks_status': lambda self: [(p, 0.0) for p in config['mount_points']]})()
+    disk_manager = DiskManager(config['mount_points'], config['threshold'], config.get('disk_strategy', 'fill')) if not is_dry_run else type('FakeDisk', (), {'active_disk': config['mount_points'][0] if config['mount_points'] else "/dry/run/dest", 'get_current_destination': lambda self: self.active_disk, 'get_all_disks_status': lambda self: [(p, 0.0) for p in config['mount_points']]})()
     if not is_dry_run and not disk_manager.active_disk: return
 
     for i in range(1, config['threads'] + 1):
