@@ -464,7 +464,14 @@ def main(args):
 
     if not copy_jobs and not archive_jobs:
         console.print("[green]Все задания уже выполнены. Завершение работы.[/green]"); return
-
+    # --- НОВЫЙ БЛОК: ФИЛЬТРАЦИЯ ЗАДАНИЙ В ЗАВИСИМОСТИ ОТ РЕЖИМА ---
+    if args.mode == 'copy':
+        console.print("[bold cyan]Режим 'только копирование': задания на архивацию будут пропущены.[/bold cyan]")
+        archive_jobs = []
+    elif args.mode == 'archive':
+        console.print("[bold yellow]Режим 'только архивация': задания на копирование будут пропущены.[/bold yellow]")
+        copy_jobs = []
+    # --- КОНЕЦ НОВОГО БЛОКА ---
     # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Отчет и подтверждение всегда вызываются
     if not show_summary_and_confirm(copy_jobs, archive_jobs, stats):
         console.print("[yellow]Выполнение отменено пользователем.[/yellow]"); sys.exit(0)
@@ -576,5 +583,6 @@ if __name__ == "__main__":
     source_group.add_argument("-i", "--input-file", help="Путь к CSV файлу со списком исходных файлов.")
     source_group.add_argument("-s", "--source-dir", help="Путь к исходной директории для сканирования.")
     parser.add_argument("--dry-run", action="store_true", help="Выполнить анализ без реального копирования.")
+    parser.add_argument("--mode", choices=['all', 'copy', 'archive'], default='all', help="Режим работы: 'all' - всё (по умолчанию), 'copy' - только копирование, 'archive' - только архивация.")
     args = parser.parse_args()
     main(args)
