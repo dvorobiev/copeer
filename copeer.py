@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     'dry_run_mapping_file': "dry_run_mapping.csv",
     'threads': 8,
     'disk_strategy': "round_robin", #or fill
+    'max_concurrent_disks': "2",
     'min_files_for_sequence': 50,
     'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
 }
@@ -53,42 +54,41 @@ worker_stats = {}
 
 # --- Основные классы ---
 
+# Замените этот класс целиком
 class DiskManager:
     """
     Управляет выбором диска для записи, поддерживая две стратегии:
     - 'fill': Заполнять один диск, затем переходить к следующему.
-    - 'round_robin': Распределять задания по дискам по кругу.
+    - 'round_robin': Распределять задания по ограниченному пулу дисков.
     """
-    def __init__(self, mount_points, threshold, strategy='fill', is_dry_run=False):
+    def __init__(self, mount_points, threshold, strategy='fill', is_dry_run=False, max_concurrent_disks=999):
         self.mount_points = mount_points
         self.threshold = threshold
         self.strategy = strategy
-        self.is_dry_run = is_dry_run # Сохраняем флаг
+        self.is_dry_run = is_dry_run
+        self.max_concurrent_disks = max_concurrent_disks # <-- НОВЫЙ ПАРАМЕТР
         self.active_disk = None
         self.next_disk_index = 0
         self.lock = Lock()
 
         log.info(f"Стратегия распределения по дискам: [bold cyan]{self.strategy}[/bold cyan]")
+        if self.strategy == 'round_robin':
+            log.info(f"Максимальное кол-во одновременно используемых дисков: [bold cyan]{self.max_concurrent_disks}[/bold cyan]")
         self._select_initial_disk()
 
     def _get_disk_usage(self, path):
-        # В режиме dry-run всегда считаем, что диск пуст, и не трогаем ФС
-        if self.is_dry_run:
-           return 0.0
-
-        if not os.path.exists(path): return 100.0 # Считаем недоступный диск полным
+        if self.is_dry_run: return 0.0
+        if not os.path.exists(path): return 100.0
         try:
             st = os.statvfs(path)
             used = (st.f_blocks - st.f_bfree) * st.f_frsize
             total = st.f_blocks * st.f_frsize
             return round(used / total * 100, 2) if total > 0 else 0.0
-        except FileNotFoundError:
-            return 100.0
+        except FileNotFoundError: return 100.0
 
     def _select_initial_disk(self):
-        # Эта функция нужна в основном для стратегии 'fill' и для первоначальной проверки
         for mount in self.mount_points:
-            if not os.path.exists(mount):
+            if not self.is_dry_run and not os.path.exists(mount):
                 log.warning(f"Точка монтирования [bold yellow]{mount}[/bold yellow] не существует. Пропускаю.")
                 continue
             if self._get_disk_usage(mount) < self.threshold:
@@ -99,30 +99,37 @@ class DiskManager:
         raise RuntimeError("Не найдено подходящих дисков")
 
     def get_current_destination(self):
-        """Возвращает путь к целевому диску в зависимости от выбранной стратегии."""
-        with self.lock: # Блокировка необходима, т.к. несколько потоков будут вызывать этот метод
-
-            # 1. Получаем список всех дисков, на которые еще можно писать
-            usable_disks = [m for m in self.mount_points if os.path.exists(m) and self._get_disk_usage(m) < self.threshold]
+        with self.lock:
+            if self.is_dry_run:
+                # В dry-run режиме считаем все диски из конфига доступными
+                usable_disks = self.mount_points
+            else:
+                usable_disks = [m for m in self.mount_points if os.path.exists(m) and self._get_disk_usage(m) < self.threshold]
 
             if not usable_disks:
                 raise RuntimeError("🛑 Нет доступных дисков: все переполнены или недоступны.")
 
-            # 2. Выбираем диск в зависимости от стратегии
             if self.strategy == 'round_robin':
-                # --- ЛОГИКА 'ROUND_ROBIN' ---
-                if self.next_disk_index >= len(usable_disks):
-                    self.next_disk_index = 0 # Сбрасываем индекс, если список дисков сократился
+                # --- ЛОГИКА ОГРАНИЧЕНИЯ ПУЛА ДИСКОВ ---
+                # Берем срез из N-первых доступных дисков
+                active_pool = usable_disks[:self.max_concurrent_disks]
 
-                selected_disk = usable_disks[self.next_disk_index]
-                # Передвигаем указатель на следующий диск для следующего вызова
-                self.next_disk_index = (self.next_disk_index + 1) % len(usable_disks)
+                if not active_pool: # На случай если usable_disks пуст
+                    raise RuntimeError("🛑 В активном пуле не осталось дисков.")
+
+                # Сбрасываем индекс, если он вышел за пределы (например, диск заполнился)
+                if self.next_disk_index >= len(active_pool):
+                    self.next_disk_index = 0
+
+                selected_disk = active_pool[self.next_disk_index]
+                # Передвигаем указатель для следующего вызова, используя размер АКТИВНОГО пула
+                self.next_disk_index = (self.next_disk_index + 1) % len(active_pool)
                 return selected_disk
 
             else: # --- ЛОГИКА 'FILL' (старое поведение) ---
                 if self.active_disk not in usable_disks:
                     log.warning(f"Диск [bold]{self.active_disk}[/bold] заполнен или недоступен. Ищу следующий...")
-                    self.active_disk = usable_disks[0] # Просто берем первый доступный
+                    self.active_disk = usable_disks[0]
                     log.info(f"Переключился на диск: [bold green]{self.active_disk}[/bold green]")
                 return self.active_disk
 
@@ -532,7 +539,13 @@ def main(args):
         console.print("[yellow]Выполнение отменено пользователем.[/yellow]"); sys.exit(0)
 
 # Создаем настоящий DiskManager всегда, но передаем ему флаг is_dry_run
-    disk_manager = DiskManager(config['mount_points'], config['threshold'], config.get('disk_strategy', 'fill'), is_dry_run=is_dry_run)
+    disk_manager = DiskManager(
+        config['mount_points'],
+        config['threshold'],
+        config.get('disk_strategy', 'fill'),
+        is_dry_run=is_dry_run,
+        max_concurrent_disks=config.get('max_concurrent_disks', 999) # 999 - "бесконечность" по умолчанию
+    )
     if not is_dry_run and not disk_manager.active_disk: return
 
     for i in range(1, config['threads'] + 1):
