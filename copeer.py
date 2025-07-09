@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     'error_log_file': "errors.log",
     'dry_run_mapping_file': "dry_run_mapping.csv",
     'threads': 8,
-    'disk_strategy: round_robin', #or fill
+    'disk_strategy': "round_robin", #or fill
     'min_files_for_sequence': 50,
     'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
 }
@@ -59,18 +59,23 @@ class DiskManager:
     - 'fill': Заполнять один диск, затем переходить к следующему.
     - 'round_robin': Распределять задания по дискам по кругу.
     """
-    def __init__(self, mount_points, threshold, strategy='fill'):
+    def __init__(self, mount_points, threshold, strategy='fill', is_dry_run=False):
         self.mount_points = mount_points
         self.threshold = threshold
         self.strategy = strategy
-        self.active_disk = None  # Для стратегии 'fill'
-        self.next_disk_index = 0 # Для стратегии 'round_robin'
+        self.is_dry_run = is_dry_run # Сохраняем флаг
+        self.active_disk = None
+        self.next_disk_index = 0
         self.lock = Lock()
 
         log.info(f"Стратегия распределения по дискам: [bold cyan]{self.strategy}[/bold cyan]")
         self._select_initial_disk()
 
     def _get_disk_usage(self, path):
+        # В режиме dry-run всегда считаем, что диск пуст, и не трогаем ФС
+        if self.is_dry_run:
+           return 0.0
+
         if not os.path.exists(path): return 100.0 # Считаем недоступный диск полным
         try:
             st = os.statvfs(path)
@@ -312,23 +317,38 @@ def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
 
 # ИСПРАВЛЕНО: Явно принимает is_dry_run
 # Замените эту функцию целиком
+# Замените эту функцию целиком
 def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debug_mode, progress_callback=None):
     """
-    Обрабатывает задание, отправляет обновления в очередь и корректно парсит rsync, читая посимвольно.
+    Обрабатывает задание, отправляет обновления (включая индекс диска) в очередь
+    и корректно парсит rsync.
     """
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     op_type_text = "[yellow]Архивация[/yellow]" if job['type'] == 'sequence' else "[cyan]Копирование[/cyan]"
-    status_queue.put((worker_id, {"status": op_type_text, "job": job, "progress": 0}))
+    # Сразу ставим начальный статус, чтобы не было пустой строки
+    status_queue.put((worker_id, {"status": op_type_text, "job": job, "progress": 0, "disk_idx": None}))
 
     try:
         dest_mount_point = disk_manager.get_current_destination()
+
+        # --- НОВЫЙ БЛОК: ОПРЕДЕЛЯЕМ ИНДЕКС ДИСКА ---
+        disk_idx = '?'
+        try:
+            # Находим индекс диска в списке из конфига (+1 для человеческого счета)
+            disk_idx = config['mount_points'].index(dest_mount_point) + 1
+        except (ValueError, KeyError):
+            pass # Если диска нет в списке, останется '?'
+        # ----------------------------------------
+
+        # Обновляем статус, теперь уже с номером диска
+        status_queue.put((worker_id, {"disk_idx": disk_idx}))
+
         source_root = config.get('source_root')
         destination_root = config.get('destination_root', '/')
         absolute_source_key = job['key']
-        if source_root and absolute_source_key.startswith(os.path.normpath(source_root) + os.sep):
-            rel_path = os.path.relpath(absolute_source_key, source_root)
-        else:
-            rel_path = absolute_source_key.lstrip(os.path.sep)
+
+        # Используем os.path.relpath для надежного расчета относительного пути
+        rel_path = os.path.relpath(absolute_source_key, source_root) if source_root and absolute_source_key.startswith(source_root) else absolute_source_key.lstrip(os.path.sep)
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
         source_keys_to_log = []
 
@@ -345,36 +365,27 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
         else:  # 'file'
             source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
-                # --- ИСПРАВЛЕННЫЙ БЛОК: ЗАПУСК RSYNC С ПОСИМВОЛЬНЫМ ЧТЕНИЕМ ---
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
                 rsync_cmd = ["rsync", "-a", "--no-i-r", "--progress", absolute_source_key, dest_path]
-                status_queue.put((worker_id, {"status": "[blue]rsync...[/blue]", "progress": 0}))
+                status_queue.put((worker_id, {"status": "[blue]rsync...[/blue]"}))
 
                 process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
-
                 progress_re = re.compile(r'\s+(\d+)%')
                 line_buffer = ""
-                # Читаем по одному символу, чтобы ловить и '\r' и '\n'
                 for char in iter(lambda: process.stdout.read(1), ''):
                     if char in ['\r', '\n']:
-                        match = progress_re.search(line_buffer)
-                        if match:
-                            percentage = int(match.group(1))
-                            status_queue.put((worker_id, {"progress": percentage}))
-                        line_buffer = "" # Сбрасываем буфер строки
+                        if match := progress_re.search(line_buffer):
+                            status_queue.put((worker_id, {"progress": int(match.group(1))}))
+                        line_buffer = ""
                     else:
-                        line_buffer += char # Накапливаем строку
+                        line_buffer += char
 
                 process.stdout.close()
                 return_code = process.wait()
-                if return_code != 0:
-                    error_output = process.stderr.read()
-                    # Игнорируем ошибку от прерывания по Ctrl+C
-                    if "died with <Signals.SIGINT: 2>" not in error_output and return_code != -2:
-                         raise subprocess.CalledProcessError(return_code, rsync_cmd, stderr=error_output)
-                # -----------------------------------------------------------------
+                if return_code != 0 and "died with <Signals.SIGINT: 2>" not in (error_output := process.stderr.read()) and return_code != -2:
+                    raise subprocess.CalledProcessError(return_code, rsync_cmd, stderr=error_output)
             else: # Dry-run
                 steps = 5 if is_debug_mode else 3
                 delay = 0.7 if is_debug_mode else 0.2
@@ -391,10 +402,8 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
             status_queue.put((worker_id, {"status": "[bold red]Ошибка[/bold red]", "progress": 0}))
             log.error(f"Ошибка при обработке {job['key']}: {e}")
             with file_lock:
-                with open(config['error_log_file'], "a", encoding='utf-8') as f:
-                    f.write(f"{time.asctime()};{job['key']};{e}\n")
-        return (None, 0, None, None)
-# --- Функции TUI ---
+                with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
+        return (None, 0, None, None)# --- Функции TUI ---
 
 def make_layout() -> Layout:
     layout = Layout(name="root")
@@ -437,29 +446,42 @@ def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
         table.add_row(f"[bold]{mount}{is_active}[/bold]", size_str, bar, f"{percent:.1f}%")
     return Panel(table, title="📦 Диски", border_style="blue")
 
+# Замените эту функцию целиком
 def generate_workers_panel(threads) -> Panel:
     table = Table(box=None, expand=True, show_header=True)
     table.add_column("Размер", justify="right", style="cyan", width=12)
     table.add_column("Имя файла", style="white", no_wrap=True, ratio=2)
-    table.add_column("Статус", justify="left", style="white", width=15)
+    table.add_column("Статус", justify="left", style="white", width=20) # Немного увеличим ширину
     table.add_column("Прогресс", justify="left", ratio=2)
+
     for worker_id in range(1, threads + 1):
-        stats = worker_stats.get(worker_id) # Используем get для безопасности
+        stats = worker_stats.get(worker_id)
         if stats and (job := stats.get("job")):
             size_str = decimal(job['size'])
             short_name = job.get('tar_filename') or os.path.basename(job['key'])
-            status_text, progress_val = stats.get("status", ""), stats.get("progress", 0)
+            status_text = stats.get("status", "")
+            progress_val = stats.get("progress", 0)
+
+            # --- НОВЫЙ БЛОК: ФОРМИРУЕМ СТРОКУ СТАТУСА С ДИСКОМ ---
+            disk_idx = stats.get("disk_idx")
+            if disk_idx:
+                status_with_disk = f"{status_text} [dim]➜ [[/dim][bold cyan]{disk_idx}[/bold cyan][dim]][/dim]"
+            else:
+                status_with_disk = status_text
+            # -----------------------------------------------------
+
             progress_widget = ""
             if isinstance(progress_val, (int, float)) and progress_val > 0:
                 progress_widget = Progress(BarColumn(bar_width=None), TaskProgressColumn(), expand=True)
                 progress_widget.add_task("p", total=100, completed=progress_val)
-            else:
-                progress_widget = str(progress_val) if progress_val else ""
-            table.add_row(size_str, short_name, status_text, progress_widget)
+            elif progress_val:
+                progress_widget = str(progress_val)
+
+            table.add_row(size_str, short_name, status_with_disk, progress_widget)
         elif stats:
             table.add_row("[dim]---[/dim]", f"[grey50]{stats.get('status', 'Ожидание...')}[/grey50]", "", "")
-    return Panel(table, title=f"👷 Потоки ({threads})", border_style="green")
 
+    return Panel(table, title=f"👷 Потоки ({threads})", border_style="green")
 # --- Точка входа ---
 
 def main(args):
@@ -509,7 +531,8 @@ def main(args):
     if not show_summary_and_confirm(copy_jobs, archive_jobs, stats):
         console.print("[yellow]Выполнение отменено пользователем.[/yellow]"); sys.exit(0)
 
-    disk_manager = DiskManager(config['mount_points'], config['threshold'], config.get('disk_strategy', 'fill')) if not is_dry_run else type('FakeDisk', (), {'active_disk': config['mount_points'][0] if config['mount_points'] else "/dry/run/dest", 'get_current_destination': lambda self: self.active_disk, 'get_all_disks_status': lambda self: [(p, 0.0) for p in config['mount_points']]})()
+# Создаем настоящий DiskManager всегда, но передаем ему флаг is_dry_run
+    disk_manager = DiskManager(config['mount_points'], config['threshold'], config.get('disk_strategy', 'fill'), is_dry_run=is_dry_run)
     if not is_dry_run and not disk_manager.active_disk: return
 
     for i in range(1, config['threads'] + 1):
