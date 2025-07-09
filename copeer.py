@@ -414,7 +414,7 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
 
 def make_layout() -> Layout:
     layout = Layout(name="root")
-    layout.split_column(Layout(name="top", size=5), Layout(name="middle"), Layout(name="bottom", size=3))
+    layout.split_column(Layout(name="top", size=10), Layout(name="middle"), Layout(name="bottom", size=3))
     layout["top"].split_row(Layout(name="summary"), Layout(name="disks"))
     return layout
 
