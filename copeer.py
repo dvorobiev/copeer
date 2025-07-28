@@ -57,16 +57,15 @@ worker_stats = {}
 # Замените этот класс целиком
 class DiskManager:
     """
-    Управляет выбором диска для записи, поддерживая две стратегии:
-    - 'fill': Заполнять один диск, затем переходить к следующему.
-    - 'round_robin': Распределять задания по ограниченному пулу дисков.
+    Управляет выбором диска для записи, поддерживая две стратегии и
+    проверяя наличие достаточного свободного места для конкретного задания.
     """
     def __init__(self, mount_points, threshold, strategy='fill', is_dry_run=False, max_concurrent_disks=999):
         self.mount_points = mount_points
         self.threshold = threshold
         self.strategy = strategy
         self.is_dry_run = is_dry_run
-        self.max_concurrent_disks = max_concurrent_disks # <-- НОВЫЙ ПАРАМЕТР
+        self.max_concurrent_disks = int(max_concurrent_disks)
         self.active_disk = None
         self.next_disk_index = 0
         self.lock = Lock()
@@ -77,6 +76,7 @@ class DiskManager:
         self._select_initial_disk()
 
     def _get_disk_usage(self, path):
+        """Возвращает использование диска в процентах."""
         if self.is_dry_run: return 0.0
         if not os.path.exists(path): return 100.0
         try:
@@ -86,50 +86,69 @@ class DiskManager:
             return round(used / total * 100, 2) if total > 0 else 0.0
         except FileNotFoundError: return 100.0
 
+    # НОВЫЙ МЕТОД: Получаем свободное место в байтах
+    def _get_disk_free_space(self, path):
+        """Возвращает свободное место на диске в байтах."""
+        if self.is_dry_run: return sys.maxsize # В dry-run считаем, что место бесконечно
+        if not os.path.exists(path): return 0
+        try:
+            st = os.statvfs(path)
+            # st.f_bavail - количество свободных блоков, доступных непривилегированным пользователям
+            return st.f_bavail * st.f_frsize
+        except FileNotFoundError:
+            return 0
+
+    # НОВЫЙ МЕТОД: Комплексная проверка диска
+    def _is_disk_suitable(self, mount_path, required_space=0):
+        """Проверяет, подходит ли диск по всем критериям (существует, не переполнен, есть место)."""
+        if not self.is_dry_run:
+            if not os.path.exists(mount_path):
+                return False
+            if self._get_disk_usage(mount_path) >= self.threshold:
+                return False
+            if self._get_disk_free_space(mount_path) <= required_space:
+                return False
+        return True
+
     def _select_initial_disk(self):
+        # Проверяем, есть ли хотя бы один диск, подходящий для файла нулевого размера
         for mount in self.mount_points:
-            if not self.is_dry_run and not os.path.exists(mount):
-                log.warning(f"Точка монтирования [bold yellow]{mount}[/bold yellow] не существует. Пропускаю.")
-                continue
-            if self._get_disk_usage(mount) < self.threshold:
+            if self._is_disk_suitable(mount):
                 self.active_disk = mount
                 log.info(f"Найден как минимум один доступный диск для начала работы: [bold green]{self.active_disk}[/bold green]")
                 return
         log.error("🛑 Не найдено подходящих дисков для начала работы.")
         raise RuntimeError("Не найдено подходящих дисков")
 
-    def get_current_destination(self):
+    # ИЗМЕНЕНО: Метод теперь принимает размер задания
+    def get_current_destination(self, job_size=0):
+        """
+        Находит подходящий диск для записи, учитывая размер задания.
+        """
         with self.lock:
-            if self.is_dry_run:
-                # В dry-run режиме считаем все диски из конфига доступными
-                usable_disks = self.mount_points
-            else:
-                usable_disks = [m for m in self.mount_points if os.path.exists(m) and self._get_disk_usage(m) < self.threshold]
+            # Получаем список дисков, которые подходят для ДАННОГО задания
+            suitable_disks = [m for m in self.mount_points if self._is_disk_suitable(m, job_size)]
 
-            if not usable_disks:
-                raise RuntimeError("🛑 Нет доступных дисков: все переполнены или недоступны.")
+            if not suitable_disks:
+                raise RuntimeError(f"🛑 Нет доступных дисков для файла размером {decimal(job_size)}: все переполнены или недоступны.")
 
             if self.strategy == 'round_robin':
-                # --- ЛОГИКА ОГРАНИЧЕНИЯ ПУЛА ДИСКОВ ---
-                # Берем срез из N-первых доступных дисков
-                active_pool = usable_disks[:self.max_concurrent_disks]
+                # Ограничиваем пул только подходящими дисками
+                active_pool = suitable_disks[:self.max_concurrent_disks]
+                if not active_pool:
+                     raise RuntimeError(f"🛑 В активном пуле не осталось дисков для файла размером {decimal(job_size)}.")
 
-                if not active_pool: # На случай если usable_disks пуст
-                    raise RuntimeError("🛑 В активном пуле не осталось дисков.")
-
-                # Сбрасываем индекс, если он вышел за пределы (например, диск заполнился)
                 if self.next_disk_index >= len(active_pool):
                     self.next_disk_index = 0
 
                 selected_disk = active_pool[self.next_disk_index]
-                # Передвигаем указатель для следующего вызова, используя размер АКТИВНОГО пула
                 self.next_disk_index = (self.next_disk_index + 1) % len(active_pool)
                 return selected_disk
 
-            else: # --- ЛОГИКА 'FILL' (старое поведение) ---
-                if self.active_disk not in usable_disks:
-                    log.warning(f"Диск [bold]{self.active_disk}[/bold] заполнен или недоступен. Ищу следующий...")
-                    self.active_disk = usable_disks[0]
+            else: # Стратегия 'fill'
+                if self.active_disk not in suitable_disks:
+                    log.warning(f"Диск [bold]{self.active_disk}[/bold] не подходит для задания размером {decimal(job_size)}. Ищу следующий...")
+                    self.active_disk = suitable_disks[0] # Берем первый из подходящих
                     log.info(f"Переключился на диск: [bold green]{self.active_disk}[/bold green]")
                 return self.active_disk
 
@@ -336,7 +355,8 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
     status_queue.put((worker_id, {"status": op_type_text, "job": job, "progress": 0, "disk_idx": None}))
 
     try:
-        dest_mount_point = disk_manager.get_current_destination()
+        # ИЗМЕНЕНО: Передаем размер задания в DiskManager для умного выбора диска
+        dest_mount_point = disk_manager.get_current_destination(job['size'])
 
         # --- НОВЫЙ БЛОК: ОПРЕДЕЛЯЕМ ИНДЕКС ДИСКА ---
         disk_idx = '?'
@@ -410,11 +430,11 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
             log.error(f"Ошибка при обработке {job['key']}: {e}")
             with file_lock:
                 with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
-        return (None, 0, None, None)# --- Функции TUI ---
+        return (None, 0, None, None)
 
 def make_layout() -> Layout:
     layout = Layout(name="root")
-    layout.split_column(Layout(name="top", size=10), Layout(name="middle"), Layout(name="bottom", size=3))
+    layout.split_column(Layout(name="top", size=19), Layout(name="middle"), Layout(name="bottom", size=3))
     layout["top"].split_row(Layout(name="summary"), Layout(name="disks"))
     return layout
 
