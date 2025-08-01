@@ -350,58 +350,54 @@ def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
 # Замените эту функцию целиком
 def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debug_mode, progress_callback=None):
     """
-    Обрабатывает задание, отправляет обновления (включая индекс диска) в очередь
-    и корректно парсит rsync.
+    Обрабатывает задание, отправляет обновления в очередь и корректно логирует ошибки
+    как для отдельных файлов, так и для секвенций.
     """
     short_name = job.get('tar_filename') or os.path.basename(job['key'])
     op_type_text = "[yellow]Архивация[/yellow]" if job['type'] == 'sequence' else "[cyan]Копирование[/cyan]"
-    # Сразу ставим начальный статус, чтобы не было пустой строки
     status_queue.put((worker_id, {"status": op_type_text, "job": job, "progress": 0, "disk_idx": None}))
 
     try:
-        # ИЗМЕНЕНО: Передаем размер задания в DiskManager для умного выбора диска
         dest_mount_point = disk_manager.get_current_destination(job['size'])
 
-        # --- НОВЫЙ БЛОК: ОПРЕДЕЛЯЕМ ИНДЕКС ДИСКА ---
         disk_idx = '?'
         try:
-            # Находим индекс диска в списке из конфига (+1 для человеческого счета)
             disk_idx = config['mount_points'].index(dest_mount_point) + 1
         except (ValueError, KeyError):
-            pass # Если диска нет в списке, останется '?'
-        # ----------------------------------------
+            pass
 
-        # Обновляем статус, теперь уже с номером диска
         status_queue.put((worker_id, {"disk_idx": disk_idx}))
 
         source_root = config.get('source_root')
         destination_root = config.get('destination_root', '/')
         absolute_source_key = job['key']
 
-        # Используем os.path.relpath для надежного расчета относительного пути
         rel_path = os.path.relpath(absolute_source_key, source_root) if source_root and absolute_source_key.startswith(source_root) else absolute_source_key.lstrip(os.path.sep)
         dest_path = os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path))
+
         source_keys_to_log = []
 
         if job['type'] == 'sequence':
+            # Для секвенций в лог состояния пойдут все исходные файлы
+            source_keys_to_log = job.get('source_files', [])
             if not is_dry_run:
                 if not archive_sequence_to_destination(job, dest_path, progress_callback):
                     raise RuntimeError(f"Не удалось создать архив {short_name}")
-            else:
+            else: # Dry-run симуляция
                 total_files = len(job.get('source_files', []))
                 for i in range(total_files):
                     time.sleep(0.005)
                     if progress_callback: progress_callback(i + 1, total_files)
-            source_keys_to_log = job['source_files']
         else:  # 'file'
+            # Для обычного файла - только его ключ
             source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
                 if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
+                # ... (блок rsync остается без изменений)
                 rsync_cmd = ["rsync", "-a", "--no-i-r", "--progress", absolute_source_key, dest_path]
                 status_queue.put((worker_id, {"status": "[blue]rsync...[/blue]"}))
-
                 process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
                 progress_re = re.compile(r'\s+(\d+)%')
                 line_buffer = ""
@@ -412,12 +408,12 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
                         line_buffer = ""
                     else:
                         line_buffer += char
-
                 process.stdout.close()
                 return_code = process.wait()
                 if return_code != 0 and "died with <Signals.SIGINT: 2>" not in (error_output := process.stderr.read()) and return_code != -2:
                     raise subprocess.CalledProcessError(return_code, rsync_cmd, stderr=error_output)
-            else: # Dry-run
+
+            else: # Dry-run симуляция
                 steps = 5 if is_debug_mode else 3
                 delay = 0.7 if is_debug_mode else 0.2
                 for i in range(steps):
@@ -427,13 +423,30 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
         final_status = "[bold green]Завершено[/bold green]"
         if is_dry_run: final_status = "[green]Готово (dr)[/green]"
         status_queue.put((worker_id, {"status": final_status, "progress": 100}))
+
+        # Возвращаем тип, размер и КЛЮЧИ ИСХОДНЫХ ФАЙЛОВ для записи в лог состояния
         return (job['type'], job['size'], source_keys_to_log, dest_path)
+
     except Exception as e:
         if not isinstance(e, KeyboardInterrupt):
             status_queue.put((worker_id, {"status": "[bold red]Ошибка[/bold red]", "progress": 0}))
-            log.error(f"Ошибка при обработке {job['key']}: {e}")
-            with file_lock:
-                with open(config['error_log_file'], "a", encoding='utf-8') as f: f.write(f"{time.asctime()};{job['key']};{e}\n")
+
+            # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ В ЛОГИРОВАНИИ ОШИБОК ---
+            if job['type'] == 'sequence':
+                # Если упала секвенция, логируем все её ИСХОДНЫЕ файлы
+                log.error(f"Ошибка при обработке секвенции {job['key']}: {e}")
+                error_message = f"Sequence processing failed for '{job['key']}': {e}"
+                with file_lock:
+                    with open(config['error_log_file'], "a", encoding='utf-8') as f:
+                        for source_file in job.get('source_files', []):
+                             f.write(f"{time.asctime()};{source_file};{error_message}\n")
+            else:
+                # Если упал обычный файл, логируем его ключ, как и раньше
+                log.error(f"Ошибка при обработке {job['key']}: {e}")
+                with file_lock:
+                    with open(config['error_log_file'], "a", encoding='utf-8') as f:
+                        f.write(f"{time.asctime()};{job['key']};{e}\n")
+
         return (None, 0, None, None)
 
 def make_layout() -> Layout:
