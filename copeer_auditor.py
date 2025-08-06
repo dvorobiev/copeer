@@ -1,12 +1,11 @@
-# copeer_auditor.py (v3.1 - Compact & Comparative Stats)
+# copeer_auditor.py (v3.3 - Dynamic Path Normalization)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.1: Переработан вывод статистики для компактности и наглядного
-      сравнения структуры каталогов источника и назначения.
+v3.3: Заменена жесткая привязка к именам каталогов ('#NEW_FILMS') на
+      динамическое определение структуры пути.
 """
-import argparse
 import csv
 import os
 import sys
@@ -35,27 +34,23 @@ def normalize_directory_path(path_str: str) -> str:
     """
     Приводит путь к общему виду для сравнения, убирая префиксы дисков
     и оставляя только значимую часть структуры.
+    Работает динамически, находя '/mnt/' префикс.
     """
-    # Список возможных "корней" проекта внутри пути
-    project_roots = ['#NEW_FILMS', 'raidix']
     p = Path(path_str)
+    parts = p.parts
 
-    for root_name in project_roots:
-        try:
-            # Находим индекс "корня" в частях пути
-            root_index = p.parts.index(root_name)
-            # Возвращаем путь, начиная с этого корня
-            # Если корень 'raidix', то включаем его, иначе - нет
-            start_index = root_index if root_name == 'raidix' else root_index
+    # Динамический поиск: если путь начинается с /mnt/<something>/...
+    # Это наиболее надежный способ отсечь специфичную для машины часть пути.
+    if len(parts) > 3 and parts[0] == '/' and parts[1] == 'mnt':
+        # Значимая часть начинается после /mnt/<disk_name>
+        # Берем 3 уровня вложенности для сравнения
+        relevant_parts = parts[3:3+3]
+        return str(Path(*relevant_parts))
 
-            # Ограничиваем глубину, чтобы избежать слишком длинных уникальных путей
-            relevant_parts = p.parts[start_index : start_index + 4]
-            return str(Path(*relevant_parts))
-        except (ValueError, IndexError):
-            continue # Корень не найден, пробуем следующий
-
-    # Если ни один корень не найден, возвращаем как есть (обрезанный)
-    return str(Path(*p.parts[-4:]))
+    # Запасной вариант для путей, не соответствующих шаблону (например, относительных)
+    # или если структура иная. Берем последние 3 компонента.
+    fallback_parts = parts[-3:]
+    return str(Path(*fallback_parts))
 
 # --- Функции команд ---
 
@@ -71,6 +66,9 @@ def handle_stats():
     try:
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             rows = [row for row in csv.reader(f) if len(row) >= 2]
+            if not rows or len(rows) < 2:
+                console.print("[yellow]Файл маппинга пуст или содержит только заголовок.[/yellow]")
+                return
             header = rows.pop(0)
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]")
