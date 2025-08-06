@@ -1,9 +1,11 @@
-# copeer_auditor.py (v3.7 - Corrected Autocompletion Import)
+# copeer_auditor.py (v3.9 - Robust Autocompletion)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.7: Исправлен неверный путь импорта для PathCompleter.
+v3.9: Реализован отказоустойчивый импорт PathCompleter. Автодополнение
+      включается, только если версия 'rich' его поддерживает,
+      в противном случае скрипт работает без него, не вызывая ошибок.
 """
 import csv
 import os
@@ -11,17 +13,25 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-# Сторонние библиотеки (убедитесь, что rich установлен: pip install rich)
+# Сторонние библиотеки
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress
 from rich.prompt import Prompt, Confirm
-from rich.completion import PathCompleter # ИСПРАВЛЕНИЕ: Правильный импорт
 from rich.panel import Panel
 
 console = Console()
-# Создаем один экземпляр автодополнителя для многократного использования
-path_completer = PathCompleter(expanduser=True)
+
+# --- ИСПРАВЛЕНИЕ: Отказоустойчивый импорт автодополнения ---
+try:
+    # Пытаемся импортировать PathCompleter из правильного места
+    from rich.prompt import PathCompleter
+    path_completer = PathCompleter(expanduser=True, allow_directories=True)
+    console.print("[dim]Автодополнение путей по Tab активно.[/dim]")
+except ImportError:
+    # Если не получилось, просто отключаем эту функцию
+    path_completer = None
+    console.print("[yellow]Предупреждение: не удалось загрузить автодополнение путей. Обновите 'rich' (`uv pip install --upgrade rich`)[/yellow]")
 
 
 # --- Вспомогательные функции ---
@@ -64,7 +74,8 @@ def handle_stats():
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
     map_file_path = Prompt.ask(
         "[bold]Укажите путь к mapping.csv файлу[/bold]",
-        completer=path_completer
+        completer=path_completer,
+        default="./mapping_master.csv"
     )
 
     if not os.path.exists(map_file_path):
