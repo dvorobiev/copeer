@@ -1,11 +1,10 @@
-# copeer_auditor.py (v3.5 - Intelligent Source Root Detection)
+# copeer_auditor.py (v3.6 - Path Autocompletion)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.5: Полностью переработан механизм определения source_root. Теперь
-      он интеллектуально сопоставляет пути из state-файла и
-      исходного списка для точного определения корневого каталога.
+v3.6: Добавлено автодополнение путей к файлам и директориям по
+      нажатию на Tab во всех соответствующих запросах.
 """
 import csv
 import os
@@ -17,10 +16,13 @@ from collections import defaultdict
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt, Confirm, PathCompleter # ИЗМЕНЕНИЕ: Импортируем PathCompleter
 from rich.panel import Panel
 
 console = Console()
+# ИЗМЕНЕНИЕ: Создаем один экземпляр автодополнителя для многократного использования
+path_completer = PathCompleter(expanduser=True)
+
 
 # --- Вспомогательные функции ---
 
@@ -41,41 +43,30 @@ def normalize_directory_path(path_str: str) -> str:
     return str(Path(*fallback_parts))
 
 def find_source_root(state_file_paths, source_list_paths):
-    """
-    Интеллектуально определяет source_root, сопоставляя абсолютные пути
-    из state-файла с относительными из исходного списка.
-    """
     if not state_file_paths or not source_list_paths:
         return None
-
-    # Ищем первый попавшийся файл, который есть в обоих наборах (по имени файла)
-    # Это дает нам пару путей для сопоставления
     source_map = {os.path.basename(p): p for p in source_list_paths}
-
     for abs_path_str in state_file_paths:
         basename = os.path.basename(abs_path_str)
         if basename in source_map:
             rel_path_str = source_map[basename]
-
-            # Убираем возможный префикс './' из относительного пути
             rel_path_clean = rel_path_str.lstrip('./')
-
-            # Если абсолютный путь заканчивается на относительный, "откусываем" его
             if abs_path_str.endswith(rel_path_clean):
                 end_index = abs_path_str.rfind(rel_path_clean)
                 source_root = abs_path_str[:end_index]
-                # Убираем лишний слэш в конце, если он есть
                 return source_root.rstrip('/')
-
-    return None # Не удалось найти совпадение
+    return None
 
 
 # --- Функции команд ---
 
 def handle_stats():
-    # ... (код этой функции не менялся)
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
-    map_file_path = Prompt.ask("[bold]Укажите путь к mapping.csv файлу[/bold]")
+    # ИЗМЕНЕНИЕ: Добавляем `completer`
+    map_file_path = Prompt.ask(
+        "[bold]Укажите путь к mapping.csv файлу[/bold]",
+        completer=path_completer
+    )
 
     if not os.path.exists(map_file_path):
         console.print(f"[bold red]Ошибка: Файл '{map_file_path}' не найден.[/bold red]")
@@ -146,9 +137,12 @@ def handle_stats():
 
 
 def handle_merge():
-    # ... (код этой функции не менялся)
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
-    maps_dir_path = Prompt.ask("[bold]Укажите путь к директории с mapping-файлами[/bold]")
+    # ИЗМЕНЕНИЕ: Добавляем `completer`
+    maps_dir_path = Prompt.ask(
+        "[bold]Укажите путь к директории с mapping-файлами[/bold]",
+        completer=path_completer
+    )
     maps_dir = Path(maps_dir_path)
 
     if not maps_dir.is_dir():
@@ -204,14 +198,21 @@ def handle_merge():
 
 
 def handle_analyze():
-    # --- ЭТА ФУНКЦИЯ БЫЛА ПЕРЕРАБОТАНА ---
     console.rule("[bold yellow]2. Анализ полноты копирования[/bold yellow]")
-    source_list_path = Prompt.ask("[bold]Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов[/bold]")
+    # ИЗМЕНЕНИЕ: Добавляем `completer`
+    source_list_path = Prompt.ask(
+        "[bold]Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов[/bold]",
+        completer=path_completer
+    )
     if not os.path.exists(source_list_path):
         console.print(f"[bold red]Ошибка: Файл '{source_list_path}' не найден.[/bold red]")
         return
 
-    state_file_path = Prompt.ask("[bold]Укажите путь к файлу состояния (copier_state.csv)[/bold]")
+    # ИЗМЕНЕНИЕ: Добавляем `completer`
+    state_file_path = Prompt.ask(
+        "[bold]Укажите путь к файлу состояния (copier_state.csv)[/bold]",
+        completer=path_completer
+    )
     if not os.path.exists(state_file_path):
         console.print(f"[bold red]Ошибка: Файл '{state_file_path}' не найден.[/bold red]")
         return
@@ -249,7 +250,6 @@ def handle_analyze():
         console.print("   [dim]или если структура путей в файлах сильно различается. Пути будут считаться абсолютными.[/dim]")
         source_root = ""
 
-    # Теперь строим полное множество абсолютных путей, которые должны были быть скопированы
     intended_files_abs = {os.path.normpath(os.path.join(source_root, p.lstrip('./'))) for p in source_list_paths_rel}
 
     missing_files_abs = sorted(list(intended_files_abs - processed_files_abs))
@@ -268,12 +268,9 @@ def handle_analyze():
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter=';')
             for abs_path in missing_files_abs:
-                # Находим оригинальный относительный путь для записи в файл
                 rel_path = os.path.relpath(abs_path, source_root) if source_root else abs_path
-                # На Windows могут быть обратные слэши, приводим к Unix-стандарту
                 rel_path_unix = rel_path.replace(os.path.sep, '/')
 
-                # Ищем по нескольким вариантам, включая './' префикс
                 original_rel_path = None
                 if rel_path_unix in source_data_map:
                     original_rel_path = rel_path_unix
@@ -288,9 +285,12 @@ def handle_analyze():
 
 
 def handle_verify():
-    # ... (код этой функции не менялся)
     console.rule("[bold blue]3. Верификация файлов на дисках[/bold blue]")
-    map_file_path = Prompt.ask("[bold]Укажите путь к mapping-файлу (например, mapping_master.csv)[/bold]")
+    # ИЗМЕНЕНИЕ: Добавляем `completer`
+    map_file_path = Prompt.ask(
+        "[bold]Укажите путь к mapping-файлу (например, mapping_master.csv)[/bold]",
+        completer=path_completer
+    )
     if not os.path.exists(map_file_path):
         console.print(f"[bold red]Ошибка: Файл '{map_file_path}' не найден.[/bold red]")
         return
@@ -334,7 +334,6 @@ def handle_verify():
             console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
 
 def show_menu():
-    # ... (код этой функции не менялся)
     console.rule("[bold]Меню Copeer Auditor[/bold]")
     table = Table(box=None, show_header=False)
     table.add_column(style="cyan")
@@ -347,7 +346,6 @@ def show_menu():
     console.print(table)
 
 def main():
-    # ... (код этой функции не менялся)
     while True:
         show_menu()
         choice = Prompt.ask("\n[bold]Выберите действие[/bold]", choices=['1', '2', '3', '4', 'q'], default='q')
