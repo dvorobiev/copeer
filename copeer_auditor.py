@@ -1,10 +1,11 @@
-# copeer_auditor.py (v3.3 - Dynamic Path Normalization)
+# copeer_auditor.py (v3.4 - Correct Physical File Stats)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.3: Заменена жесткая привязка к именам каталогов ('#NEW_FILMS') на
-      динамическое определение структуры пути.
+v3.4: Исправлена логика подсчета статистики. Теперь она корректно
+      отображает распределение УНИКАЛЬНЫХ физических файлов по
+      дискам, а не общее количество записей в логе.
 """
 import csv
 import os
@@ -17,6 +18,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress
 from rich.prompt import Prompt, Confirm
+from rich.panel import Panel
 
 console = Console()
 
@@ -34,28 +36,19 @@ def normalize_directory_path(path_str: str) -> str:
     """
     Приводит путь к общему виду для сравнения, убирая префиксы дисков
     и оставляя только значимую часть структуры.
-    Работает динамически, находя '/mnt/' префикс.
     """
     p = Path(path_str)
     parts = p.parts
-
-    # Динамический поиск: если путь начинается с /mnt/<something>/...
-    # Это наиболее надежный способ отсечь специфичную для машины часть пути.
     if len(parts) > 3 and parts[0] == '/' and parts[1] == 'mnt':
-        # Значимая часть начинается после /mnt/<disk_name>
-        # Берем 3 уровня вложенности для сравнения
         relevant_parts = parts[3:3+3]
         return str(Path(*relevant_parts))
-
-    # Запасной вариант для путей, не соответствующих шаблону (например, относительных)
-    # или если структура иная. Берем последние 3 компонента.
     fallback_parts = parts[-3:]
     return str(Path(*fallback_parts))
 
 # --- Функции команд ---
 
 def handle_stats():
-    """Отображает детальную и компактную статистику по mapping-файлу."""
+    """Отображает детальную и корректную статистику по mapping-файлу."""
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
     map_file_path = Prompt.ask("[bold]Укажите путь к mapping.csv файлу[/bold]")
 
@@ -76,13 +69,17 @@ def handle_stats():
 
     # 1. Сбор данных
     source_dirs_raw = {os.path.dirname(row[0]) for row in rows}
-    dest_dirs_raw = {os.path.dirname(row[1]) for row in rows}
-    dest_mount_stats = defaultdict(int)
-    for _, dest_path in rows:
+
+    # ИСПРАВЛЕНИЕ: Работаем с уникальными путями назначения
+    unique_dest_paths = {row[1] for row in rows}
+    dest_dirs_raw = {os.path.dirname(p) for p in unique_dest_paths}
+
+    physical_file_stats = defaultdict(int)
+    for dest_path in unique_dest_paths:
         parts = Path(dest_path).parts
         if len(parts) > 2 and parts[1] == 'mnt':
-            mount_point = f"{parts[0]}{parts[1]}/{parts[2]}/"
-            dest_mount_stats[mount_point] += 1
+            mount_point = f"/{parts[1]}/{parts[2]}/"
+            physical_file_stats[mount_point] += 1
 
     # 2. Нормализация и сравнение каталогов
     source_dirs_norm = {normalize_directory_path(p) for p in source_dirs_raw}
@@ -92,6 +89,13 @@ def handle_stats():
     # 3. Вывод
     console.clear()
     console.rule(f"[bold]Статистика для [cyan]{os.path.basename(map_file_path)}[/cyan][/bold]")
+
+    # Общая сводка по записям
+    summary_text = (
+        f"Обработано записей (исходных файлов): [cyan]{len(rows):,}[/cyan]\n"
+        f"Создано физических файлов/архивов: [green bold]{len(unique_dest_paths):,}[/green bold]"
+    )
+    console.print(Panel(summary_text, title="Общая сводка", border_style="dim"))
 
     # Таблица сравнения каталогов
     dir_table = Table(title="Сводка по структуре каталогов", padding=(0, 1))
@@ -105,19 +109,18 @@ def handle_stats():
         dir_table.add_row(d, in_source, in_dest)
 
     # Таблица статистики по дискам
-    disk_table = Table(title="Распределение файлов по дискам", padding=(0, 1))
+    disk_table = Table(title="Распределение физических файлов по дискам", padding=(0, 1))
     disk_table.add_column("Диск", style="green")
     disk_table.add_column("Кол-во файлов", style="green bold", justify="right")
 
-    total_files = 0
-    for mp, count in sorted(dest_mount_stats.items(), key=lambda item: item[1], reverse=True):
+    total_phys_files = 0
+    for mp, count in sorted(physical_file_stats.items(), key=lambda item: item[1], reverse=True):
         disk_table.add_row(mp, f"{count:,}")
-        total_files += count
+        total_phys_files += count
     disk_table.add_section()
-    disk_table.add_row("[bold]Всего[/bold]", f"[bold]{total_files:,}[/bold]")
+    disk_table.add_row("[bold]Всего[/bold]", f"[bold]{total_phys_files:,}[/bold]")
 
-    # Размещаем таблицы рядом для компактности
-    layout_table = Table.grid(expand=True)
+    layout_table = Table.grid(expand=True, padding=(1,3))
     layout_table.add_column(ratio=2)
     layout_table.add_column(ratio=1)
     layout_table.add_row(dir_table, disk_table)
@@ -126,7 +129,6 @@ def handle_stats():
 
 
 def handle_merge():
-    """Склеивает mapping-файлы с предварительной аналитикой и подтверждением."""
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
     maps_dir_path = Prompt.ask("[bold]Укажите путь к директории с mapping-файлами[/bold]")
     maps_dir = Path(maps_dir_path)
@@ -150,7 +152,7 @@ def handle_merge():
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 reader = csv.reader(f)
                 try:
-                    next(reader) # Пропускаем заголовок
+                    next(reader)
                     rows = [tuple(row) for row in reader if len(row) >= 2]
                     file_stats.append((file_path.name, len(rows)))
                     all_unique_mappings.update(rows)
@@ -184,7 +186,6 @@ def handle_merge():
 
 
 def handle_analyze():
-    """Сравнивает исходный список и state-файл для поиска необработанных файлов."""
     console.rule("[bold yellow]2. Анализ полноты копирования[/bold yellow]")
     source_list_path = Prompt.ask("[bold]Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов[/bold]")
     if not os.path.exists(source_list_path):
@@ -252,7 +253,6 @@ def handle_analyze():
 
 
 def handle_verify():
-    """Проверяет физическое наличие КОНЕЧНЫХ файлов на дисках по mapping-файлу."""
     console.rule("[bold blue]3. Верификация файлов на дисках[/bold blue]")
     map_file_path = Prompt.ask("[bold]Укажите путь к mapping-файлу (например, mapping_master.csv)[/bold]")
     if not os.path.exists(map_file_path):
@@ -298,7 +298,6 @@ def handle_verify():
             console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
 
 def show_menu():
-    """Отображает главное меню."""
     console.rule("[bold]Меню Copeer Auditor[/bold]")
     table = Table(box=None, show_header=False)
     table.add_column(style="cyan")
@@ -311,7 +310,6 @@ def show_menu():
     console.print(table)
 
 def main():
-    """Главная функция с интерактивным меню."""
     while True:
         show_menu()
         choice = Prompt.ask("\n[bold]Выберите действие[/bold]", choices=['1', '2', '3', '4', 'q'], default='q')
