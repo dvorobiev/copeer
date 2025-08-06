@@ -1,10 +1,9 @@
-# copeer_auditor.py (v3.6 - Path Autocompletion)
+# copeer_auditor.py (v3.7 - Corrected Autocompletion Import)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.6: Добавлено автодополнение путей к файлам и директориям по
-      нажатию на Tab во всех соответствующих запросах.
+v3.7: Исправлен неверный путь импорта для PathCompleter.
 """
 import csv
 import os
@@ -16,11 +15,12 @@ from collections import defaultdict
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress
-from rich.prompt import Prompt, Confirm, PathCompleter # ИЗМЕНЕНИЕ: Импортируем PathCompleter
+from rich.prompt import Prompt, Confirm
+from rich.completion import PathCompleter # ИСПРАВЛЕНИЕ: Правильный импорт
 from rich.panel import Panel
 
 console = Console()
-# ИЗМЕНЕНИЕ: Создаем один экземпляр автодополнителя для многократного использования
+# Создаем один экземпляр автодополнителя для многократного использования
 path_completer = PathCompleter(expanduser=True)
 
 
@@ -62,7 +62,6 @@ def find_source_root(state_file_paths, source_list_paths):
 
 def handle_stats():
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
-    # ИЗМЕНЕНИЕ: Добавляем `completer`
     map_file_path = Prompt.ask(
         "[bold]Укажите путь к mapping.csv файлу[/bold]",
         completer=path_completer
@@ -138,7 +137,6 @@ def handle_stats():
 
 def handle_merge():
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
-    # ИЗМЕНЕНИЕ: Добавляем `completer`
     maps_dir_path = Prompt.ask(
         "[bold]Укажите путь к директории с mapping-файлами[/bold]",
         completer=path_completer
@@ -199,7 +197,6 @@ def handle_merge():
 
 def handle_analyze():
     console.rule("[bold yellow]2. Анализ полноты копирования[/bold yellow]")
-    # ИЗМЕНЕНИЕ: Добавляем `completer`
     source_list_path = Prompt.ask(
         "[bold]Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов[/bold]",
         completer=path_completer
@@ -208,7 +205,6 @@ def handle_analyze():
         console.print(f"[bold red]Ошибка: Файл '{source_list_path}' не найден.[/bold red]")
         return
 
-    # ИЗМЕНЕНИЕ: Добавляем `completer`
     state_file_path = Prompt.ask(
         "[bold]Укажите путь к файлу состояния (copier_state.csv)[/bold]",
         completer=path_completer
@@ -286,7 +282,6 @@ def handle_analyze():
 
 def handle_verify():
     console.rule("[bold blue]3. Верификация файлов на дисках[/bold blue]")
-    # ИЗМЕНЕНИЕ: Добавляем `completer`
     map_file_path = Prompt.ask(
         "[bold]Укажите путь к mapping-файлу (например, mapping_master.csv)[/bold]",
         completer=path_completer
