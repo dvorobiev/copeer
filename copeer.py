@@ -309,25 +309,39 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
     }
     return copy_jobs_to_process, archive_jobs_to_process, stats
 
+# Замените эту функцию целиком
 def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
     while True:
         console.rule("[yellow]Отчет по анализу[/]")
         report_table = Table(title=None, show_header=False, box=None, padding=(0, 2))
         report_table.add_column("Параметр", style="cyan", no_wrap=True)
         report_table.add_column("Значение", style="white", justify="right")
+
+        # --- Блок 1: Анализ исходного источника (CSV или директории) ---
         if stats.get("mode") == "csv":
-            report_table.add_row("Всего строк в CSV файле:", f"{stats.get('lines_total', 0):,}")
-            report_table.add_row("  Пропущено (директории):", f"[dim]{stats.get('lines_ignored_dirs', 0):,}[/dim]")
+            report_table.add_row("Всего строк в CSV:", f"{stats.get('lines_total', 0):,}")
             malformed_count = len(stats.get('malformed_lines', []))
-            report_table.add_row(f"  Пропущено (некорректный формат):", f"[{'red' if malformed_count > 0 else 'dim'}]{malformed_count:,}[/]")
-        report_table.add_row("[bold]Найдено файлов для обработки:", f"[bold green]{stats.get('total_found', 0):,}[/bold green]")
+            # Новая, более понятная формулировка
+            report_table.add_row("  Пропущено (некорректный формат):", f"[{'red' if malformed_count > 0 else 'dim'}]{malformed_count:,}[/]")
+            report_table.add_row("  Пропущено (записи с типом 'directory'):", f"[dim]{stats.get('lines_ignored_dirs', 0):,}[/dim]")
+            report_table.add_section()
+
+        # --- Блок 2: Сводка по найденным файлам и их разбивка по статусу ---
+        total_valid_files = stats.get('total_found', 0)
+        report_table.add_row("[bold]Всего найдено валидных файлов:", f"[bold green]{total_valid_files:,}[/bold green]")
         report_table.add_section()
+
+        # Теперь расчеты и вывод стали логичными
         archive_size = sum(j.get('size', 0) for j in archive_jobs)
         copy_size = sum(j.get('size', 0) for j in copy_jobs)
-        report_table.add_row("Заданий на архивацию:", f"[yellow]{len(archive_jobs):,}[/yellow] ({decimal(archive_size)})")
-        report_table.add_row("Заданий на копирование:", f"[yellow]{len(copy_jobs):,}[/yellow] ({decimal(copy_size)})")
-        total_processed_count = stats.get('total_found', 0) - (len(copy_jobs) + len(archive_jobs))
-        report_table.add_row("Пропущено (уже выполнены):", f"[dim]{total_processed_count:,}[/dim]")
+
+        # Рассчитываем количество уже обработанных файлов
+        processed_count = total_valid_files - (len(copy_jobs) + len(archive_jobs))
+
+        report_table.add_row("Уже обработано (пропущено):", f"[dim]{processed_count:,}[/dim]")
+        report_table.add_row("Новых заданий на архивацию:", f"[yellow]{len(archive_jobs):,}[/yellow] ({decimal(archive_size)})")
+        report_table.add_row("Новых заданий на копирование:", f"[yellow]{len(copy_jobs):,}[/yellow] ({decimal(copy_size)})")
+
         console.print(report_table)
 
         choices = ["s", "q"]
@@ -344,7 +358,6 @@ def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
             for num, line, reason in malformed_lines[:50]: console.print(f"[dim]Строка #{num} ({reason}):[/dim] {line}")
             console.input("\n[bold]Нажмите [green]Enter[/green] для возврата в меню...[/bold]")
             console.clear()
-
 # ИСПРАВЛЕНО: Явно принимает is_dry_run
 # Замените эту функцию целиком
 # Замените эту функцию целиком
