@@ -1,11 +1,11 @@
-# copeer_auditor.py (v3.4 - Correct Physical File Stats)
+# copeer_auditor.py (v3.5 - Intelligent Source Root Detection)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.4: Исправлена логика подсчета статистики. Теперь она корректно
-      отображает распределение УНИКАЛЬНЫХ физических файлов по
-      дискам, а не общее количество записей в логе.
+v3.5: Полностью переработан механизм определения source_root. Теперь
+      он интеллектуально сопоставляет пути из state-файла и
+      исходного списка для точного определения корневого каталога.
 """
 import csv
 import os
@@ -25,7 +25,6 @@ console = Console()
 # --- Вспомогательные функции ---
 
 def parse_scientific_notation(size_str: str) -> int:
-    """Парсит размер файла из научной нотации или обычного числа."""
     try:
         cleaned_str = str(size_str).replace(',', '.').strip()
         if 'E' in cleaned_str.upper(): return int(float(cleaned_str))
@@ -33,10 +32,6 @@ def parse_scientific_notation(size_str: str) -> int:
     except (ValueError, TypeError): return 0
 
 def normalize_directory_path(path_str: str) -> str:
-    """
-    Приводит путь к общему виду для сравнения, убирая префиксы дисков
-    и оставляя только значимую часть структуры.
-    """
     p = Path(path_str)
     parts = p.parts
     if len(parts) > 3 and parts[0] == '/' and parts[1] == 'mnt':
@@ -45,10 +40,40 @@ def normalize_directory_path(path_str: str) -> str:
     fallback_parts = parts[-3:]
     return str(Path(*fallback_parts))
 
+def find_source_root(state_file_paths, source_list_paths):
+    """
+    Интеллектуально определяет source_root, сопоставляя абсолютные пути
+    из state-файла с относительными из исходного списка.
+    """
+    if not state_file_paths or not source_list_paths:
+        return None
+
+    # Ищем первый попавшийся файл, который есть в обоих наборах (по имени файла)
+    # Это дает нам пару путей для сопоставления
+    source_map = {os.path.basename(p): p for p in source_list_paths}
+
+    for abs_path_str in state_file_paths:
+        basename = os.path.basename(abs_path_str)
+        if basename in source_map:
+            rel_path_str = source_map[basename]
+
+            # Убираем возможный префикс './' из относительного пути
+            rel_path_clean = rel_path_str.lstrip('./')
+
+            # Если абсолютный путь заканчивается на относительный, "откусываем" его
+            if abs_path_str.endswith(rel_path_clean):
+                end_index = abs_path_str.rfind(rel_path_clean)
+                source_root = abs_path_str[:end_index]
+                # Убираем лишний слэш в конце, если он есть
+                return source_root.rstrip('/')
+
+    return None # Не удалось найти совпадение
+
+
 # --- Функции команд ---
 
 def handle_stats():
-    """Отображает детальную и корректную статистику по mapping-файлу."""
+    # ... (код этой функции не менялся)
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
     map_file_path = Prompt.ask("[bold]Укажите путь к mapping.csv файлу[/bold]")
 
@@ -67,10 +92,7 @@ def handle_stats():
         console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]")
         return
 
-    # 1. Сбор данных
     source_dirs_raw = {os.path.dirname(row[0]) for row in rows}
-
-    # ИСПРАВЛЕНИЕ: Работаем с уникальными путями назначения
     unique_dest_paths = {row[1] for row in rows}
     dest_dirs_raw = {os.path.dirname(p) for p in unique_dest_paths}
 
@@ -81,23 +103,19 @@ def handle_stats():
             mount_point = f"/{parts[1]}/{parts[2]}/"
             physical_file_stats[mount_point] += 1
 
-    # 2. Нормализация и сравнение каталогов
     source_dirs_norm = {normalize_directory_path(p) for p in source_dirs_raw}
     dest_dirs_norm = {normalize_directory_path(p) for p in dest_dirs_raw}
     all_unique_dirs = sorted(list(source_dirs_norm.union(dest_dirs_norm)))
 
-    # 3. Вывод
     console.clear()
     console.rule(f"[bold]Статистика для [cyan]{os.path.basename(map_file_path)}[/cyan][/bold]")
 
-    # Общая сводка по записям
     summary_text = (
         f"Обработано записей (исходных файлов): [cyan]{len(rows):,}[/cyan]\n"
         f"Создано физических файлов/архивов: [green bold]{len(unique_dest_paths):,}[/green bold]"
     )
     console.print(Panel(summary_text, title="Общая сводка", border_style="dim"))
 
-    # Таблица сравнения каталогов
     dir_table = Table(title="Сводка по структуре каталогов", padding=(0, 1))
     dir_table.add_column("Общий каталог", style="magenta", no_wrap=True)
     dir_table.add_column("Источник", justify="center")
@@ -108,7 +126,6 @@ def handle_stats():
         in_dest = "[green]✅[/green]" if d in dest_dirs_norm else "[red]❌[/red]"
         dir_table.add_row(d, in_source, in_dest)
 
-    # Таблица статистики по дискам
     disk_table = Table(title="Распределение физических файлов по дискам", padding=(0, 1))
     disk_table.add_column("Диск", style="green")
     disk_table.add_column("Кол-во файлов", style="green bold", justify="right")
@@ -129,6 +146,7 @@ def handle_stats():
 
 
 def handle_merge():
+    # ... (код этой функции не менялся)
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
     maps_dir_path = Prompt.ask("[bold]Укажите путь к директории с mapping-файлами[/bold]")
     maps_dir = Path(maps_dir_path)
@@ -186,6 +204,7 @@ def handle_merge():
 
 
 def handle_analyze():
+    # --- ЭТА ФУНКЦИЯ БЫЛА ПЕРЕРАБОТАНА ---
     console.rule("[bold yellow]2. Анализ полноты копирования[/bold yellow]")
     source_list_path = Prompt.ask("[bold]Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов[/bold]")
     if not os.path.exists(source_list_path):
@@ -199,60 +218,77 @@ def handle_analyze():
 
     try:
         with open(state_file_path, 'r', encoding='utf-8') as f:
-            processed_files = {row[0] for row in csv.reader(f) if row}
-        console.print(f"Загружено [bold]{len(processed_files):,}[/bold] записей из файла состояния.")
+            processed_files_abs = {row[0] for row in csv.reader(f) if row}
+        console.print(f"Загружено [bold]{len(processed_files_abs):,}[/bold] записей из файла состояния.")
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать state-файл: {e}[/bold red]")
         return
 
-    console.print("Анализ исходного списка и автоматическое определение `source_root`...")
-    all_source_paths_from_list, source_data_map = [], {}
+    console.print("Анализ исходного списка...")
+    source_list_paths_rel, source_data_map = [], {}
     try:
         with open(source_list_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f, delimiter=';')
             for row in reader:
                 if not row or len(row) < 5 or 'directory' in row[1]: continue
-                path_str = row[0]
-                all_source_paths_from_list.append(path_str)
-                source_data_map[path_str] = [path_str, 'file', parse_scientific_notation(row[4]), '', row[4]]
+                rel_path_str = row[0]
+                source_list_paths_rel.append(rel_path_str)
+                source_data_map[rel_path_str] = [rel_path_str, 'file', parse_scientific_notation(row[4]), '', row[4]]
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать исходный список: {e}[/bold red]")
         return
 
-    source_root = os.path.commonpath(all_source_paths_from_list) if all_source_paths_from_list else None
+    console.print("Интеллектуальное определение `source_root`...")
+    source_root = find_source_root(processed_files_abs, source_list_paths_rel)
+
     if source_root:
-        console.print(f"Автоматически определен `source_root`: [cyan]{source_root}[/cyan]")
+        console.print(f"✅ Автоматически определен `source_root`: [cyan]{source_root}[/cyan]")
     else:
-        console.print("[yellow]Не удалось определить общий `source_root`. Пути будут считаться абсолютными.[/yellow]")
+        console.print("[bold yellow]Не удалось определить `source_root` автоматически.[/bold yellow]")
+        console.print("   [dim]Это может случиться, если ни один файл из исходного списка еще не был скопирован,[/dim]")
+        console.print("   [dim]или если структура путей в файлах сильно различается. Пути будут считаться абсолютными.[/dim]")
         source_root = ""
 
-    intended_files = {os.path.normpath(os.path.join(source_root, p) if not os.path.isabs(p) else p) for p in all_source_paths_from_list}
+    # Теперь строим полное множество абсолютных путей, которые должны были быть скопированы
+    intended_files_abs = {os.path.normpath(os.path.join(source_root, p.lstrip('./'))) for p in source_list_paths_rel}
 
-    missing_files = sorted(list(intended_files - processed_files))
+    missing_files_abs = sorted(list(intended_files_abs - processed_files_abs))
 
     table = Table(title="Отчет по анализу")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
-    table.add_row("Всего файлов в исходном списке", f"{len(intended_files):,}")
-    table.add_row("[green]Успешно обработано (есть в state-файле)[/green]", f"{len(intended_files) - len(missing_files):,}")
-    table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"[red]{len(missing_files):,}")
+    table.add_row("Всего файлов в исходном списке", f"{len(intended_files_abs):,}")
+    table.add_row("[green]Успешно обработано (есть в state-файле)[/green]", f"{len(intended_files_abs) - len(missing_files_abs):,}")
+    table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"[red]{len(missing_files_abs):,}")
     console.print(table)
 
-    if missing_files:
+    if missing_files_abs:
         output_file = "missing_for_copy.csv"
-        console.print(f"\nСохранение списка из {len(missing_files):,} необработанных файлов в [bold cyan]{output_file}[/bold cyan]...")
+        console.print(f"\nСохранение списка из {len(missing_files_abs):,} необработанных файлов в [bold cyan]{output_file}[/bold cyan]...")
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter=';')
-            for abs_path in missing_files:
-                rel_path = os.path.relpath(abs_path, source_root)
-                if rel_path in source_data_map:
-                    writer.writerow(source_data_map[rel_path])
+            for abs_path in missing_files_abs:
+                # Находим оригинальный относительный путь для записи в файл
+                rel_path = os.path.relpath(abs_path, source_root) if source_root else abs_path
+                # На Windows могут быть обратные слэши, приводим к Unix-стандарту
+                rel_path_unix = rel_path.replace(os.path.sep, '/')
+
+                # Ищем по нескольким вариантам, включая './' префикс
+                original_rel_path = None
+                if rel_path_unix in source_data_map:
+                    original_rel_path = rel_path_unix
+                elif f"./{rel_path_unix}" in source_data_map:
+                    original_rel_path = f"./{rel_path_unix}"
+
+                if original_rel_path:
+                    writer.writerow(source_data_map[original_rel_path])
         console.print(f"✅ Готово. Используйте [bold]'{output_file}'[/bold] как --input-file для copeer.py.")
     else:
         console.print("\n[bold green]✅ Отлично! Все файлы из исходного списка были обработаны.[/bold green]")
 
 
 def handle_verify():
+    # ... (код этой функции не менялся)
     console.rule("[bold blue]3. Верификация файлов на дисках[/bold blue]")
     map_file_path = Prompt.ask("[bold]Укажите путь к mapping-файлу (например, mapping_master.csv)[/bold]")
     if not os.path.exists(map_file_path):
@@ -298,6 +334,7 @@ def handle_verify():
             console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
 
 def show_menu():
+    # ... (код этой функции не менялся)
     console.rule("[bold]Меню Copeer Auditor[/bold]")
     table = Table(box=None, show_header=False)
     table.add_column(style="cyan")
@@ -310,6 +347,7 @@ def show_menu():
     console.print(table)
 
 def main():
+    # ... (код этой функции не менялся)
     while True:
         show_menu()
         choice = Prompt.ask("\n[bold]Выберите действие[/bold]", choices=['1', '2', '3', '4', 'q'], default='q')
