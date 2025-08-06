@@ -1,14 +1,10 @@
-# copeer_auditor.py (v3 - Interactive Menu & Auto-Detection)
+# copeer_auditor.py (v3.1 - Compact & Comparative Stats)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-Возможности:
-- Интерактивное меню для выбора действия.
-- Слияние mapping-файлов с предварительной аналитикой.
-- Анализ полноты копирования с автоматическим определением source_root.
-- Верификация физического наличия файлов на дисках.
-- Сбор и отображение детальной статистики по mapping-файлу.
+v3.1: Переработан вывод статистики для компактности и наглядного
+      сравнения структуры каталогов источника и назначения.
 """
 import argparse
 import csv
@@ -35,10 +31,36 @@ def parse_scientific_notation(size_str: str) -> int:
         return int(cleaned_str)
     except (ValueError, TypeError): return 0
 
+def normalize_directory_path(path_str: str) -> str:
+    """
+    Приводит путь к общему виду для сравнения, убирая префиксы дисков
+    и оставляя только значимую часть структуры.
+    """
+    # Список возможных "корней" проекта внутри пути
+    project_roots = ['#NEW_FILMS', 'raidix']
+    p = Path(path_str)
+
+    for root_name in project_roots:
+        try:
+            # Находим индекс "корня" в частях пути
+            root_index = p.parts.index(root_name)
+            # Возвращаем путь, начиная с этого корня
+            # Если корень 'raidix', то включаем его, иначе - нет
+            start_index = root_index if root_name == 'raidix' else root_index
+
+            # Ограничиваем глубину, чтобы избежать слишком длинных уникальных путей
+            relevant_parts = p.parts[start_index : start_index + 4]
+            return str(Path(*relevant_parts))
+        except (ValueError, IndexError):
+            continue # Корень не найден, пробуем следующий
+
+    # Если ни один корень не найден, возвращаем как есть (обрезанный)
+    return str(Path(*p.parts[-4:]))
+
 # --- Функции команд ---
 
 def handle_stats():
-    """НОВАЯ ФУНКЦИЯ: Отображает детальную статистику по mapping-файлу."""
+    """Отображает детальную и компактную статистику по mapping-файлу."""
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
     map_file_path = Prompt.ask("[bold]Укажите путь к mapping.csv файлу[/bold]")
 
@@ -49,22 +71,14 @@ def handle_stats():
     try:
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             rows = [row for row in csv.reader(f) if len(row) >= 2]
-            header = rows.pop(0) # Убираем заголовок
+            header = rows.pop(0)
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]")
         return
 
-    total_files = len(rows)
-    state_file_path = os.path.join(os.path.dirname(map_file_path), "copier_state.csv")
-    state_lines = 0
-    if os.path.exists(state_file_path):
-        with open(state_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            state_lines = sum(1 for _ in f)
-
-    console.print(f"\n[cyan]Общее число записей в[/cyan] [white]{os.path.basename(map_file_path)}[/white]: [green bold]{total_files:,}[/green bold]")
-    console.print(f"[cyan]Число строк в[/cyan] [white]{os.path.basename(state_file_path)}[/white]: [green bold]{state_lines:,}[/green bold]")
-
-    # Статистика по точкам монтирования назначения
+    # 1. Сбор данных
+    source_dirs_raw = {os.path.dirname(row[0]) for row in rows}
+    dest_dirs_raw = {os.path.dirname(row[1]) for row in rows}
     dest_mount_stats = defaultdict(int)
     for _, dest_path in rows:
         parts = Path(dest_path).parts
@@ -72,52 +86,45 @@ def handle_stats():
             mount_point = f"{parts[0]}{parts[1]}/{parts[2]}/"
             dest_mount_stats[mount_point] += 1
 
-    console.print("\n[yellow]Статистика по файлам на дисках назначения:[/yellow]")
-    if dest_mount_stats:
-        stat_table = Table(box=None, show_header=False, padding=(0,2))
-        stat_table.add_column("Mount", style="green")
-        stat_table.add_column("Count", style="green bold", justify="right")
-        for mp, count in sorted(dest_mount_stats.items(), key=lambda item: item[1], reverse=True):
-            stat_table.add_row(mp, f"{count:,}")
-        console.print(stat_table)
-    else:
-        console.print("  [dim]Данные не найдены.[/dim]")
+    # 2. Нормализация и сравнение каталогов
+    source_dirs_norm = {normalize_directory_path(p) for p in source_dirs_raw}
+    dest_dirs_norm = {normalize_directory_path(p) for p in dest_dirs_raw}
+    all_unique_dirs = sorted(list(source_dirs_norm.union(dest_dirs_norm)))
 
-    # Уникальные каталоги (источник)
-    source_dirs = set()
-    for source_path, _ in rows:
-        if source_path.startswith('/mnt/cifs/raidix/'):
-            relative_path = Path(source_path).relative_to('/mnt/cifs/raidix/')
-            if len(relative_path.parts) >= 3:
-                source_dirs.add(str(Path(*relative_path.parts[:3])))
+    # 3. Вывод
+    console.clear()
+    console.rule(f"[bold]Статистика для [cyan]{os.path.basename(map_file_path)}[/cyan][/bold]")
 
-    console.print("\n[yellow]Уникальные каталоги (3 уровня) в источнике /mnt/cifs/raidix/:[/yellow]")
-    if source_dirs:
-        for d in sorted(list(source_dirs)):
-            console.print(f"  [magenta]{d}[/magenta]")
-    else:
-        console.print("  [dim]Данные не найдены.[/dim]")
+    # Таблица сравнения каталогов
+    dir_table = Table(title="Сводка по структуре каталогов", padding=(0, 1))
+    dir_table.add_column("Общий каталог", style="magenta", no_wrap=True)
+    dir_table.add_column("Источник", justify="center")
+    dir_table.add_column("Назначение", justify="center")
 
-    # Уникальные каталоги (назначение)
-    dest_dirs = set()
-    for _, dest_path in rows:
-        if '/raidix/' in dest_path: # Более общий поиск
-            p = Path(dest_path)
-            try:
-                # Находим 'raidix' и берем путь после него
-                raidix_index = p.parts.index('raidix')
-                relative_path = Path(*p.parts[raidix_index:])
-                if len(relative_path.parts) >= 4:
-                    dest_dirs.add(str(Path(*relative_path.parts[:4])))
-            except ValueError:
-                continue # 'raidix' not in path
+    for d in all_unique_dirs:
+        in_source = "[green]✅[/green]" if d in source_dirs_norm else "[red]❌[/red]"
+        in_dest = "[green]✅[/green]" if d in dest_dirs_norm else "[red]❌[/red]"
+        dir_table.add_row(d, in_source, in_dest)
 
-    console.print("\n[yellow]Уникальные каталоги (4 уровня) в назначении (от 'raidix/'):[/yellow]")
-    if dest_dirs:
-        for d in sorted(list(dest_dirs)):
-            console.print(f"  [magenta]{d}[/magenta]")
-    else:
-        console.print("  [dim]Данные не найдены.[/dim]")
+    # Таблица статистики по дискам
+    disk_table = Table(title="Распределение файлов по дискам", padding=(0, 1))
+    disk_table.add_column("Диск", style="green")
+    disk_table.add_column("Кол-во файлов", style="green bold", justify="right")
+
+    total_files = 0
+    for mp, count in sorted(dest_mount_stats.items(), key=lambda item: item[1], reverse=True):
+        disk_table.add_row(mp, f"{count:,}")
+        total_files += count
+    disk_table.add_section()
+    disk_table.add_row("[bold]Всего[/bold]", f"[bold]{total_files:,}[/bold]")
+
+    # Размещаем таблицы рядом для компактности
+    layout_table = Table.grid(expand=True)
+    layout_table.add_column(ratio=2)
+    layout_table.add_column(ratio=1)
+    layout_table.add_row(dir_table, disk_table)
+
+    console.print(layout_table)
 
 
 def handle_merge():
@@ -163,7 +170,6 @@ def handle_merge():
     summary_table.add_row("[bold]Всего уникальных записей[/bold]", f"[bold cyan]{len(all_unique_mappings):,}[/bold cyan]")
     console.print(summary_table)
 
-    # ИЗМЕНЕНИЕ: Файл сохраняется в ту же папку, откуда брали исходники
     output_filename = "mapping_master.csv"
     output_filepath = maps_dir / output_filename
 
@@ -207,17 +213,13 @@ def handle_analyze():
             reader = csv.reader(f, delimiter=';')
             for row in reader:
                 if not row or len(row) < 5 or 'directory' in row[1]: continue
-                # Путь в исходном файле может быть как абсолютным, так и относительным.
-                # Мы собираем все, чтобы найти общий префикс.
                 path_str = row[0]
                 all_source_paths_from_list.append(path_str)
-                # Сохраняем полную строку для последующей записи в файл
                 source_data_map[path_str] = [path_str, 'file', parse_scientific_notation(row[4]), '', row[4]]
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать исходный список: {e}[/bold red]")
         return
 
-    # ИЗМЕНЕНИЕ: Автоматическое определение `source_root`
     source_root = os.path.commonpath(all_source_paths_from_list) if all_source_paths_from_list else None
     if source_root:
         console.print(f"Автоматически определен `source_root`: [cyan]{source_root}[/cyan]")
@@ -234,7 +236,7 @@ def handle_analyze():
     table.add_column("Количество", justify="right", style="white")
     table.add_row("Всего файлов в исходном списке", f"{len(intended_files):,}")
     table.add_row("[green]Успешно обработано (есть в state-файле)[/green]", f"{len(intended_files) - len(missing_files):,}")
-    table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"[red]{len(missing_files):,}[/red]")
+    table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"[red]{len(missing_files):,}")
     console.print(table)
 
     if missing_files:
@@ -242,11 +244,9 @@ def handle_analyze():
         console.print(f"\nСохранение списка из {len(missing_files):,} необработанных файлов в [bold cyan]{output_file}[/bold cyan]...")
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter=';')
-            # Восстанавливаем оригинальные относительные пути для copeer.py
             for abs_path in missing_files:
                 rel_path = os.path.relpath(abs_path, source_root)
                 if rel_path in source_data_map:
-                    # Записываем строку с относительным путем
                     writer.writerow(source_data_map[rel_path])
         console.print(f"✅ Готово. Используйте [bold]'{output_file}'[/bold] как --input-file для copeer.py.")
     else:
@@ -286,7 +286,7 @@ def handle_verify():
     table.add_column("Количество", justify="right", style="white")
     table.add_row("Всего уникальных конечных файлов", f"{len(unique_dest_paths):,}")
     table.add_row("[green]Найдено на диске[/green]", f"{found_count:,}")
-    table.add_row("[red]Отсутствует на диске[/red]", f"[red]{missing_count:,}")
+    table.add_row("[red]Отсутствует на диске[/red]", f"{missing_count:,}")
     console.print(table)
 
     if missing_paths:
