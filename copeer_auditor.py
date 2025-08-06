@@ -1,11 +1,10 @@
-# copeer_auditor.py (v3.9 - Robust Autocompletion)
+# copeer_auditor.py (v4.0 - Switched to Questionary)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v3.9: Реализован отказоустойчивый импорт PathCompleter. Автодополнение
-      включается, только если версия 'rich' его поддерживает,
-      в противном случае скрипт работает без него, не вызывая ошибок.
+v4.0: Переход с 'rich.prompt' на библиотеку 'questionary' для
+      надежного и удобного автодополнения путей и создания меню.
 """
 import csv
 import os
@@ -17,21 +16,16 @@ from collections import defaultdict
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress
-from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 
-console = Console()
+# НОВАЯ БИБЛИОТЕКА ДЛЯ ИНТЕРАКТИВНОСТИ
+import questionary
+from prompt_toolkit.completion import PathCompleter
 
-# --- ИСПРАВЛЕНИЕ: Отказоустойчивый импорт автодополнения ---
-try:
-    # Пытаемся импортировать PathCompleter из правильного места
-    from rich.prompt import PathCompleter
-    path_completer = PathCompleter(expanduser=True, allow_directories=True)
-    console.print("[dim]Автодополнение путей по Tab активно.[/dim]")
-except ImportError:
-    # Если не получилось, просто отключаем эту функцию
-    path_completer = None
-    console.print("[yellow]Предупреждение: не удалось загрузить автодополнение путей. Обновите 'rich' (`uv pip install --upgrade rich`)[/yellow]")
+console = Console()
+# Создаем один экземпляр автодополнителя для многократного использования
+path_completer = PathCompleter(expanduser=True, only_directories=False)
+dir_completer = PathCompleter(expanduser=True, only_directories=True)
 
 
 # --- Вспомогательные функции ---
@@ -72,15 +66,12 @@ def find_source_root(state_file_paths, source_list_paths):
 
 def handle_stats():
     console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
-    map_file_path = Prompt.ask(
-        "[bold]Укажите путь к mapping.csv файлу[/bold]",
+    map_file_path = questionary.path(
+        "Укажите путь к mapping.csv файлу:",
         completer=path_completer,
-        default="./mapping_master.csv"
-    )
-
-    if not os.path.exists(map_file_path):
-        console.print(f"[bold red]Ошибка: Файл '{map_file_path}' не найден.[/bold red]")
-        return
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not map_file_path: return # Пользователь отменил ввод (Ctrl+C)
 
     try:
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -148,17 +139,18 @@ def handle_stats():
 
 def handle_merge():
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
-    maps_dir_path = Prompt.ask(
-        "[bold]Укажите путь к директории с mapping-файлами[/bold]",
-        completer=path_completer
-    )
+    maps_dir_path = questionary.path(
+        "Укажите путь к директории с mapping-файлами:",
+        completer=dir_completer,
+        validate=lambda p: os.path.isdir(p) or "Директория не найдена"
+    ).ask()
+    if not maps_dir_path: return
+
     maps_dir = Path(maps_dir_path)
 
-    if not maps_dir.is_dir():
-        console.print(f"[bold red]Ошибка: Директория '{maps_dir_path}' не найдена.[/bold red]")
-        return
+    pattern = questionary.text("Укажите шаблон для поиска файлов:", default="mapping*.csv").ask()
+    if not pattern: return
 
-    pattern = Prompt.ask("[bold]Укажите шаблон для поиска файлов[/bold]", default="mapping*.csv")
     map_files = sorted(list(maps_dir.glob(pattern)))
 
     if not map_files:
@@ -194,7 +186,8 @@ def handle_merge():
     output_filename = "mapping_master.csv"
     output_filepath = maps_dir / output_filename
 
-    if not Confirm.ask(f"\n[bold]Сохранить {len(all_unique_mappings):,} записей в файл '{output_filepath}'?[/bold]"):
+    do_save = questionary.confirm(f"Сохранить {len(all_unique_mappings):,} записей в файл '{output_filepath}'?").ask()
+    if not do_save:
         console.print("[yellow]Слияние отменено пользователем.[/yellow]")
         return
 
@@ -208,21 +201,19 @@ def handle_merge():
 
 def handle_analyze():
     console.rule("[bold yellow]2. Анализ полноты копирования[/bold yellow]")
-    source_list_path = Prompt.ask(
-        "[bold]Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов[/bold]",
-        completer=path_completer
-    )
-    if not os.path.exists(source_list_path):
-        console.print(f"[bold red]Ошибка: Файл '{source_list_path}' не найден.[/bold red]")
-        return
+    source_list_path = questionary.path(
+        "Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов:",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not source_list_path: return
 
-    state_file_path = Prompt.ask(
-        "[bold]Укажите путь к файлу состояния (copier_state.csv)[/bold]",
-        completer=path_completer
-    )
-    if not os.path.exists(state_file_path):
-        console.print(f"[bold red]Ошибка: Файл '{state_file_path}' не найден.[/bold red]")
-        return
+    state_file_path = questionary.path(
+        "Укажите путь к файлу состояния (copier_state.csv):",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not state_file_path: return
 
     try:
         with open(state_file_path, 'r', encoding='utf-8') as f:
@@ -253,8 +244,6 @@ def handle_analyze():
         console.print(f"✅ Автоматически определен `source_root`: [cyan]{source_root}[/cyan]")
     else:
         console.print("[bold yellow]Не удалось определить `source_root` автоматически.[/bold yellow]")
-        console.print("   [dim]Это может случиться, если ни один файл из исходного списка еще не был скопирован,[/dim]")
-        console.print("   [dim]или если структура путей в файлах сильно различается. Пути будут считаться абсолютными.[/dim]")
         source_root = ""
 
     intended_files_abs = {os.path.normpath(os.path.join(source_root, p.lstrip('./'))) for p in source_list_paths_rel}
@@ -293,13 +282,13 @@ def handle_analyze():
 
 def handle_verify():
     console.rule("[bold blue]3. Верификация файлов на дисках[/bold blue]")
-    map_file_path = Prompt.ask(
-        "[bold]Укажите путь к mapping-файлу (например, mapping_master.csv)[/bold]",
-        completer=path_completer
-    )
-    if not os.path.exists(map_file_path):
-        console.print(f"[bold red]Ошибка: Файл '{map_file_path}' не найден.[/bold red]")
-        return
+    map_file_path = questionary.path(
+        "Укажите путь к mapping-файлу:",
+        default="./mapping_master.csv",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not map_file_path: return
 
     try:
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -330,7 +319,8 @@ def handle_verify():
     console.print(table)
 
     if missing_paths:
-        if Confirm.ask("\n[bold]Сохранить список отсутствующих файлов?[/bold]"):
+        do_save = questionary.confirm("Сохранить список отсутствующих файлов?").ask()
+        if do_save:
             output_file = "physically_missing.csv"
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -339,36 +329,40 @@ def handle_verify():
                     writer.writerow([path])
             console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
 
-def show_menu():
-    console.rule("[bold]Меню Copeer Auditor[/bold]")
-    table = Table(box=None, show_header=False)
-    table.add_column(style="cyan")
-    table.add_column()
-    table.add_row("[1]", "Склеить `mapping` файлы")
-    table.add_row("[2]", "Найти недокопированные файлы (по state-файлу)")
-    table.add_row("[3]", "Проверить наличие файлов на дисках (Верификация)")
-    table.add_row("[4]", "Показать статистику по `mapping` файлу")
-    table.add_row("[q]", "Выход")
-    console.print(table)
-
 def main():
     while True:
-        show_menu()
-        choice = Prompt.ask("\n[bold]Выберите действие[/bold]", choices=['1', '2', '3', '4', 'q'], default='q')
+        console.rule("[bold]Меню Copeer Auditor[/bold]")
+        choice = questionary.select(
+            "Выберите действие:",
+            choices=[
+                "1. Склеить `mapping` файлы",
+                "2. Найти недокопированные файлы (по state-файлу)",
+                "3. Проверить наличие файлов на дисках (Верификация)",
+                "4. Показать статистику по `mapping` файлу",
+                questionary.Separator(),
+                "Выход"
+            ],
+            use_indicator=True
+        ).ask()
 
-        if choice == '1':
-            handle_merge()
-        elif choice == '2':
-            handle_analyze()
-        elif choice == '3':
-            handle_verify()
-        elif choice == '4':
-            handle_stats()
-        elif choice == 'q':
+        if choice is None or choice == "Выход":
             console.print("[bold green]Выход.[/bold green]")
             break
 
-        Prompt.ask("\n[dim]Нажмите Enter для возврата в меню...[/dim]", default="")
+        # Очищаем экран для лучшей читаемости
+        console.clear()
+
+        if "1." in choice:
+            handle_merge()
+        elif "2." in choice:
+            handle_analyze()
+        elif "3." in choice:
+            handle_verify()
+        elif "4." in choice:
+            handle_stats()
+
+        # Пауза перед возвратом в меню
+        questionary.press_any_key_to_continue("Нажмите любую клавишу для возврата в меню...").ask()
         console.clear()
 
 if __name__ == "__main__":
