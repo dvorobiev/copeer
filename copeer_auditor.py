@@ -1,10 +1,10 @@
-# copeer_auditor.py (v4.0 - Switched to Questionary)
+# copeer_auditor.py (v4.1 - Adjusted Directory Depth)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v4.0: Переход с 'rich.prompt' на библиотеку 'questionary' для
-      надежного и удобного автодополнения путей и создания меню.
+v4.1: Увеличена глубина отображения каталогов в статистике для
+      большей детализации.
 """
 import csv
 import os
@@ -38,12 +38,18 @@ def parse_scientific_notation(size_str: str) -> int:
     except (ValueError, TypeError): return 0
 
 def normalize_directory_path(path_str: str) -> str:
+    """
+    Приводит путь к общему виду для сравнения, убирая префиксы дисков
+    и оставляя только значимую часть структуры.
+    """
     p = Path(path_str)
     parts = p.parts
     if len(parts) > 3 and parts[0] == '/' and parts[1] == 'mnt':
-        relevant_parts = parts[3:3+3]
+        # ИЗМЕНЕНИЕ: Увеличиваем глубину с 3 до 4 уровней
+        relevant_parts = parts[3:3+4]
         return str(Path(*relevant_parts))
-    fallback_parts = parts[-3:]
+    # Запасной вариант для путей, не соответствующих шаблону
+    fallback_parts = parts[-4:]
     return str(Path(*fallback_parts))
 
 def find_source_root(state_file_paths, source_list_paths):
@@ -71,7 +77,7 @@ def handle_stats():
         completer=path_completer,
         validate=lambda p: os.path.exists(p) or "Файл не найден"
     ).ask()
-    if not map_file_path: return # Пользователь отменил ввод (Ctrl+C)
+    if not map_file_path: return
 
     try:
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -349,7 +355,6 @@ def main():
             console.print("[bold green]Выход.[/bold green]")
             break
 
-        # Очищаем экран для лучшей читаемости
         console.clear()
 
         if "1." in choice:
@@ -361,7 +366,6 @@ def main():
         elif "4." in choice:
             handle_stats()
 
-        # Пауза перед возвратом в меню
         questionary.press_any_key_to_continue("Нажмите любую клавишу для возврата в меню...").ask()
         console.clear()
 
