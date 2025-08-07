@@ -1,10 +1,10 @@
-# copeer_auditor.py (v4.3 - Consistent Verification Output)
+# copeer_auditor.py (v4.4 - Fixed Rich Markup Rendering)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v4.3: Исправлен вывод в отчете верификации для отображения
-      коротких имен дисков (без /mnt/), как в статистике.
+v4.4: Исправлена ошибка, из-за которой теги форматирования Rich (e.g., [green])
+      отображались как обычный текст в отчете верификации.
 """
 import csv
 import os
@@ -102,14 +102,19 @@ def _run_verification(stats_data):
             sorted_disks = sorted(data["destinations"].items())
             for i, (disk, paths) in enumerate(sorted_disks):
                 is_any_missing = any(p in missing_paths for p in paths)
-                status_icon = "[red]❌[/red]" if is_any_missing else "[green]✅[/green]"
 
-                # ИСПРАВЛЕНИЕ: Используем короткое имя диска
+                # --- ИСПРАВЛЕНИЕ: Собираем текст по частям, применяя стили ---
+                if is_any_missing:
+                    dest_text.append("❌ ", style="bold red")
+                else:
+                    dest_text.append("✅ ", style="bold green")
+
                 disk_name = Path(disk).name
-
-                dest_text.append(f"{status_icon} {disk_name}: ", style="green")
+                dest_text.append(f"{disk_name}: ", style="green")
                 dest_text.append(f"{len(paths):,}", style="cyan")
-                if i < len(data["destinations"]) - 1:
+                # -------------------------------------------------------------
+
+                if i < len(sorted_disks) - 1:
                     dest_text.append("\n")
 
         verification_table.add_row(norm_dir, in_source, dest_text)
@@ -335,7 +340,7 @@ def handle_analyze():
     table.add_column("Количество", justify="right", style="white")
     table.add_row("Всего файлов в исходном списке", f"{len(intended_files_abs):,}")
     table.add_row("[green]Успешно обработано (есть в state-файле)[/green]", f"{len(intended_files_abs) - len(missing_files_abs):,}")
-    table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"[red]{len(missing_files_abs):,}")
+    table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"{len(missing_files_abs):,}")
     console.print(table)
 
     if missing_files_abs:
