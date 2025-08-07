@@ -1,12 +1,10 @@
-# copeer_auditor.py (v4.2 - Interactive Audit Center)
+# copeer_auditor.py (v4.3 - Consistent Verification Output)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v4.2: Объединены функции статистики и верификации в единый
-      интерактивный "Аудит-центр". Статистика теперь показывает
-      детальное распределение файлов по дискам для каждого каталога.
-      Верификация отображает результат прямо в этой таблице.
+v4.3: Исправлен вывод в отчете верификации для отображения
+      коротких имен дисков (без /mnt/), как в статистике.
 """
 import csv
 import os
@@ -101,11 +99,15 @@ def _run_verification(stats_data):
         if not data["destinations"]:
             dest_text.append("❌", style="red")
         else:
-            for i, (disk, paths) in enumerate(data["destinations"].items()):
+            sorted_disks = sorted(data["destinations"].items())
+            for i, (disk, paths) in enumerate(sorted_disks):
                 is_any_missing = any(p in missing_paths for p in paths)
                 status_icon = "[red]❌[/red]" if is_any_missing else "[green]✅[/green]"
 
-                dest_text.append(f"{status_icon} {disk}: ", style="green")
+                # ИСПРАВЛЕНИЕ: Используем короткое имя диска
+                disk_name = Path(disk).name
+
+                dest_text.append(f"{status_icon} {disk_name}: ", style="green")
                 dest_text.append(f"{len(paths):,}", style="cyan")
                 if i < len(data["destinations"]) - 1:
                     dest_text.append("\n")
@@ -198,7 +200,6 @@ def handle_stats_and_verify():
         if not data["destinations"]:
             dest_text.append("❌", style="red")
         else:
-            # Сортируем диски для консистентного вывода
             sorted_disks = sorted(data["destinations"].items())
             for i, (disk, paths) in enumerate(sorted_disks):
                 disk_name = Path(disk).name
@@ -216,7 +217,6 @@ def handle_stats_and_verify():
     if do_verify:
         _run_verification(stats_data)
 
-# Остальные функции (handle_merge, handle_analyze) остаются без изменений
 def handle_merge():
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
     maps_dir_path = questionary.path(
