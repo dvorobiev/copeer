@@ -1,10 +1,12 @@
-# copeer_auditor.py (v4.1 - Adjusted Directory Depth)
+# copeer_auditor.py (v4.2 - Interactive Audit Center)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v4.1: Увеличена глубина отображения каталогов в статистике для
-      большей детализации.
+v4.2: Объединены функции статистики и верификации в единый
+      интерактивный "Аудит-центр". Статистика теперь показывает
+      детальное распределение файлов по дискам для каждого каталога.
+      Верификация отображает результат прямо в этой таблице.
 """
 import csv
 import os
@@ -17,13 +19,13 @@ from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress
 from rich.panel import Panel
+from rich.text import Text
 
-# НОВАЯ БИБЛИОТЕКА ДЛЯ ИНТЕРАКТИВНОСТИ
+# Библиотека для интерактивности
 import questionary
 from prompt_toolkit.completion import PathCompleter
 
 console = Console()
-# Создаем один экземпляр автодополнителя для многократного использования
 path_completer = PathCompleter(expanduser=True, only_directories=False)
 dir_completer = PathCompleter(expanduser=True, only_directories=True)
 
@@ -38,17 +40,11 @@ def parse_scientific_notation(size_str: str) -> int:
     except (ValueError, TypeError): return 0
 
 def normalize_directory_path(path_str: str) -> str:
-    """
-    Приводит путь к общему виду для сравнения, убирая префиксы дисков
-    и оставляя только значимую часть структуры.
-    """
     p = Path(path_str)
     parts = p.parts
     if len(parts) > 3 and parts[0] == '/' and parts[1] == 'mnt':
-        # ИЗМЕНЕНИЕ: Увеличиваем глубину с 3 до 4 уровней
         relevant_parts = parts[3:3+4]
         return str(Path(*relevant_parts))
-    # Запасной вариант для путей, не соответствующих шаблону
     fallback_parts = parts[-4:]
     return str(Path(*fallback_parts))
 
@@ -68,10 +64,80 @@ def find_source_root(state_file_paths, source_list_paths):
     return None
 
 
-# --- Функции команд ---
+# --- Основные функции команд ---
 
-def handle_stats():
-    console.rule("[bold magenta]4. Статистика по mapping-файлу[/bold magenta]")
+def _run_verification(stats_data):
+    """Вспомогательная функция для запуска и отображения верификации."""
+    console.rule("[bold blue]Верификация файлов[/bold blue]")
+
+    all_dest_paths = []
+    for data in stats_data.values():
+        for disk_paths in data.get("destinations", {}).values():
+            all_dest_paths.extend(disk_paths)
+
+    if not all_dest_paths:
+        console.print("[yellow]Нет файлов для верификации.[/yellow]")
+        return
+
+    missing_paths = set()
+    with Progress(console=console) as progress:
+        task = progress.add_task("[green]Проверка файлов...", total=len(all_dest_paths))
+        for path in all_dest_paths:
+            if not os.path.exists(path):
+                missing_paths.add(path)
+            progress.update(task, advance=1)
+
+    # Отображение детализированного отчета верификации
+    console.rule("[bold]Отчет по верификации[/bold]")
+    verification_table = Table(title="Детализация верификации по каталогам", padding=(0, 1))
+    verification_table.add_column("Общий каталог", style="magenta", no_wrap=True)
+    verification_table.add_column("Источник", justify="center")
+    verification_table.add_column("Назначение", justify="left")
+
+    for norm_dir, data in stats_data.items():
+        in_source = "[green]✅[/green]" if data["in_source"] else "[red]❌[/red]"
+
+        dest_text = Text()
+        if not data["destinations"]:
+            dest_text.append("❌", style="red")
+        else:
+            for i, (disk, paths) in enumerate(data["destinations"].items()):
+                is_any_missing = any(p in missing_paths for p in paths)
+                status_icon = "[red]❌[/red]" if is_any_missing else "[green]✅[/green]"
+
+                dest_text.append(f"{status_icon} {disk}: ", style="green")
+                dest_text.append(f"{len(paths):,}", style="cyan")
+                if i < len(data["destinations"]) - 1:
+                    dest_text.append("\n")
+
+        verification_table.add_row(norm_dir, in_source, dest_text)
+
+    console.print(verification_table)
+
+    # Финальная сводка
+    summary_table = Table(title="Итоговая сводка верификации", show_header=False)
+    summary_table.add_column(style="cyan")
+    summary_table.add_column(justify="right", style="bold")
+    summary_table.add_row("Всего проверено файлов/архивов", f"{len(all_dest_paths):,}")
+    summary_table.add_row("Найдено на диске", f"[green]{len(all_dest_paths) - len(missing_paths):,}[/green]")
+    summary_table.add_row("Отсутствует на диске", f"[red]{len(missing_paths):,}[/red]")
+    console.print(summary_table)
+
+    if missing_paths:
+        do_save = questionary.confirm("Сохранить список отсутствующих файлов?").ask()
+        if do_save:
+            output_file = "physically_missing.csv"
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['missing_destination_path'])
+                for path in sorted(missing_paths):
+                    writer.writerow([path])
+            console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
+
+
+def handle_stats_and_verify():
+    """Отображает статистику и предлагает запустить верификацию."""
+    console.rule("[bold magenta]Аудит и верификация по mapping-файлу[/bold magenta]")
     map_file_path = questionary.path(
         "Укажите путь к mapping.csv файлу:",
         completer=path_completer,
@@ -90,59 +156,67 @@ def handle_stats():
         console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]")
         return
 
-    source_dirs_raw = {os.path.dirname(row[0]) for row in rows}
-    unique_dest_paths = {row[1] for row in rows}
-    dest_dirs_raw = {os.path.dirname(p) for p in unique_dest_paths}
+    # 1. Сбор и структурирование данных
+    source_paths = {row[0] for row in rows}
+    dest_paths = {row[1] for row in rows}
 
-    physical_file_stats = defaultdict(int)
-    for dest_path in unique_dest_paths:
-        parts = Path(dest_path).parts
-        if len(parts) > 2 and parts[1] == 'mnt':
-            mount_point = f"/{parts[1]}/{parts[2]}/"
-            physical_file_stats[mount_point] += 1
+    norm_source_dirs = {normalize_directory_path(os.path.dirname(p)) for p in source_paths}
+    all_unique_norm_dirs = sorted(list(norm_source_dirs))
 
-    source_dirs_norm = {normalize_directory_path(p) for p in source_dirs_raw}
-    dest_dirs_norm = {normalize_directory_path(p) for p in dest_dirs_raw}
-    all_unique_dirs = sorted(list(source_dirs_norm.union(dest_dirs_norm)))
+    # {norm_dir: {"in_source": bool, "destinations": {disk: [path1, path2]}}}
+    stats_data = defaultdict(lambda: {"in_source": False, "destinations": defaultdict(list)})
 
+    for p in source_paths:
+        stats_data[normalize_directory_path(os.path.dirname(p))]["in_source"] = True
+
+    for p in dest_paths:
+        norm_dir = normalize_directory_path(os.path.dirname(p))
+        parts = Path(p).parts
+        disk = f"/{parts[1]}/{parts[2]}" if len(parts) > 2 and parts[1] == 'mnt' else "unknown"
+        stats_data[norm_dir]["destinations"][disk].append(p)
+
+    # 2. Вывод статистики
     console.clear()
     console.rule(f"[bold]Статистика для [cyan]{os.path.basename(map_file_path)}[/cyan][/bold]")
 
     summary_text = (
         f"Обработано записей (исходных файлов): [cyan]{len(rows):,}[/cyan]\n"
-        f"Создано физических файлов/архивов: [green bold]{len(unique_dest_paths):,}[/green bold]"
+        f"Создано физических файлов/архивов: [green bold]{len(dest_paths):,}[/green bold]"
     )
     console.print(Panel(summary_text, title="Общая сводка", border_style="dim"))
 
-    dir_table = Table(title="Сводка по структуре каталогов", padding=(0, 1))
-    dir_table.add_column("Общий каталог", style="magenta", no_wrap=True)
-    dir_table.add_column("Источник", justify="center")
-    dir_table.add_column("Назначение", justify="center")
+    stats_table = Table(title="Детализация по каталогам и дискам", padding=(0, 1))
+    stats_table.add_column("Общий каталог", style="magenta", no_wrap=True)
+    stats_table.add_column("Источник", justify="center")
+    stats_table.add_column("Назначение", justify="left")
 
-    for d in all_unique_dirs:
-        in_source = "[green]✅[/green]" if d in source_dirs_norm else "[red]❌[/red]"
-        in_dest = "[green]✅[/green]" if d in dest_dirs_norm else "[red]❌[/red]"
-        dir_table.add_row(d, in_source, in_dest)
+    for norm_dir in all_unique_norm_dirs:
+        data = stats_data[norm_dir]
+        in_source = "[green]✅[/green]" if data["in_source"] else "[red]❌[/red]"
 
-    disk_table = Table(title="Распределение физических файлов по дискам", padding=(0, 1))
-    disk_table.add_column("Диск", style="green")
-    disk_table.add_column("Кол-во файлов", style="green bold", justify="right")
+        dest_text = Text()
+        if not data["destinations"]:
+            dest_text.append("❌", style="red")
+        else:
+            # Сортируем диски для консистентного вывода
+            sorted_disks = sorted(data["destinations"].items())
+            for i, (disk, paths) in enumerate(sorted_disks):
+                disk_name = Path(disk).name
+                dest_text.append(f"{disk_name}: ", style="green")
+                dest_text.append(f"{len(paths):,}", style="cyan")
+                if i < len(sorted_disks) - 1:
+                    dest_text.append("\n")
 
-    total_phys_files = 0
-    for mp, count in sorted(physical_file_stats.items(), key=lambda item: item[1], reverse=True):
-        disk_table.add_row(mp, f"{count:,}")
-        total_phys_files += count
-    disk_table.add_section()
-    disk_table.add_row("[bold]Всего[/bold]", f"[bold]{total_phys_files:,}[/bold]")
+        stats_table.add_row(norm_dir, in_source, dest_text)
 
-    layout_table = Table.grid(expand=True, padding=(1,3))
-    layout_table.add_column(ratio=2)
-    layout_table.add_column(ratio=1)
-    layout_table.add_row(dir_table, disk_table)
+    console.print(stats_table)
 
-    console.print(layout_table)
+    # 3. Предложение верифицировать
+    do_verify = questionary.confirm("Хотите верифицировать эти файлы?", default=False).ask()
+    if do_verify:
+        _run_verification(stats_data)
 
-
+# Остальные функции (handle_merge, handle_analyze) остаются без изменений
 def handle_merge():
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
     maps_dir_path = questionary.path(
@@ -285,56 +359,6 @@ def handle_analyze():
     else:
         console.print("\n[bold green]✅ Отлично! Все файлы из исходного списка были обработаны.[/bold green]")
 
-
-def handle_verify():
-    console.rule("[bold blue]3. Верификация файлов на дисках[/bold blue]")
-    map_file_path = questionary.path(
-        "Укажите путь к mapping-файлу:",
-        default="./mapping_master.csv",
-        completer=path_completer,
-        validate=lambda p: os.path.exists(p) or "Файл не найден"
-    ).ask()
-    if not map_file_path: return
-
-    try:
-        with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            reader = csv.reader(f)
-            next(reader)
-            unique_dest_paths = {row[1] for row in reader if len(row) >= 2}
-    except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]")
-        return
-
-    found_count, missing_count, missing_paths = 0, 0, []
-    with Progress(console=console) as progress:
-        task = progress.add_task("[green]Проверка файлов...", total=len(unique_dest_paths))
-        for dest_path in unique_dest_paths:
-            if os.path.exists(dest_path):
-                found_count += 1
-            else:
-                missing_count += 1
-                missing_paths.append(dest_path)
-            progress.update(task, advance=1)
-
-    table = Table(title=f"Отчет по верификации")
-    table.add_column("Статус", style="cyan")
-    table.add_column("Количество", justify="right", style="white")
-    table.add_row("Всего уникальных конечных файлов", f"{len(unique_dest_paths):,}")
-    table.add_row("[green]Найдено на диске[/green]", f"{found_count:,}")
-    table.add_row("[red]Отсутствует на диске[/red]", f"{missing_count:,}")
-    console.print(table)
-
-    if missing_paths:
-        do_save = questionary.confirm("Сохранить список отсутствующих файлов?").ask()
-        if do_save:
-            output_file = "physically_missing.csv"
-            with open(output_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['missing_destination_path'])
-                for path in sorted(missing_paths):
-                    writer.writerow([path])
-            console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
-
 def main():
     while True:
         console.rule("[bold]Меню Copeer Auditor[/bold]")
@@ -342,9 +366,8 @@ def main():
             "Выберите действие:",
             choices=[
                 "1. Склеить `mapping` файлы",
-                "2. Найти недокопированные файлы (по state-файлу)",
-                "3. Проверить наличие файлов на дисках (Верификация)",
-                "4. Показать статистику по `mapping` файлу",
+                "2. Найти недокопированные файлы",
+                "3. Аудит и верификация по `mapping` файлу",
                 questionary.Separator(),
                 "Выход"
             ],
@@ -362,9 +385,7 @@ def main():
         elif "2." in choice:
             handle_analyze()
         elif "3." in choice:
-            handle_verify()
-        elif "4." in choice:
-            handle_stats()
+            handle_stats_and_verify()
 
         questionary.press_any_key_to_continue("Нажмите любую клавишу для возврата в меню...").ask()
         console.clear()
