@@ -268,6 +268,7 @@ def scan_directory_and_plan_jobs(source_dir_path, config, processed_items_keys):
     stats = {"total_found": len(all_files_map), "mode": "dir"}
     return copy_jobs, archive_jobs, stats
 
+# Замените эту функцию целиком в copeer.py
 def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
     console.rule("[yellow]Шаг 1: Анализ и планирование[/]")
     console.print(f"Анализ файла: [bold cyan]{input_csv_path}[/bold cyan]")
@@ -297,18 +298,25 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
 
     sequences, sequence_files = find_sequences(dirs, config)
     standalone_files = set(all_files_from_csv.keys()) - sequence_files
+
     archive_jobs_all = sequences
     copy_jobs_all = [{'type': 'file', 'key': f, 'size': all_files_from_csv[f]} for f in standalone_files]
-    archive_jobs_to_process = [job for job in archive_jobs_all if job['key'] not in processed_items_keys]
+
+    # --- ИСПРАВЛЕННАЯ ЛОГИКА ---
+    # Проверяем не виртуальное имя архива, а наличие первого исходного файла секвенции в state-файле.
+    archive_jobs_to_process = [job for job in archive_jobs_all if job.get('source_files') and job['source_files'][0] not in processed_items_keys]
+    # ---------------------------
+
     copy_jobs_to_process = [job for job in copy_jobs_all if job['key'] not in processed_items_keys]
+
     archive_jobs_to_process.sort(key=lambda j: j.get('size', 0), reverse=True)
     copy_jobs_to_process.sort(key=lambda j: j.get('size', 0), reverse=True)
+
     stats = {
         "mode": "csv", "lines_total": lines_total, "lines_ignored_dirs": lines_ignored_dirs,
         "malformed_lines": malformed_lines, "total_found": len(all_files_from_csv)
     }
     return copy_jobs_to_process, archive_jobs_to_process, stats
-
 # Замените эту функцию целиком
 def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
     while True:
