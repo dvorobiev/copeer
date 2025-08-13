@@ -271,11 +271,12 @@ def handle_analyze():
 # <<< НОВАЯ ФУНКЦИЯ >>>
 # <<< ЗАМЕНИТЕ ВСЮ ФУНКЦИЮ handle_plan_vs_map() НА ЭТУ >>>
 
-def handle_plan_vs_map():
-    """Сравнивает файл-задание и mapping-файл. (Быстрая версия)"""
-    console.rule("[bold green]4. Сравнение файла задания и mapping-файла[/bold green]")
+# <<< ЗАМЕНИТЕ ВСЮ ФУНКЦИЮ handle_plan_vs_map() НА ЭТУ >>>
 
-    # 1. Получение путей к файлам
+def handle_plan_vs_map():
+    """Сравнивает файл-задание и mapping-файл, анализируя исходные пути."""
+    console.rule("[bold green]4. Сравнение плана и `mapping` (по исходным путям)[/bold green]")
+
     plan_file_path = questionary.path(
         "Укажите путь к файлу ЗАДАНИЯ (например, group_2.csv):",
         completer=path_completer,
@@ -290,7 +291,7 @@ def handle_plan_vs_map():
     ).ask()
     if not map_file_path: return
 
-    # 2. Загрузка данных
+    # --- 1. Загрузка данных ---
     plan_data = {} # {относительный_путь: полная_строка}
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
@@ -301,40 +302,38 @@ def handle_plan_vs_map():
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
-    map_source_paths = set()
+    # Загружаем ИСХОДНЫЕ пути из mapping-файла
+    mapped_source_paths = set()
     try:
         console.print(f"Загрузка mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f)
-            next(reader, None)
+            next(reader, None) # Пропускаем заголовок
+            # Читаем первую колонку (source_path)
             for row in reader:
                 if len(row) >= 1:
-                    map_source_paths.add(row[0])
+                    mapped_source_paths.add(row[0])
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]"); return
 
-    # <<< ИСПРАВЛЕННАЯ, БЫСТРАЯ ЛОГИКА СРАВНЕНИЯ >>>
-    console.print("Подготовка к сравнению...")
-
-    # Создаем словарь для быстрого поиска: {относительный_путь: был_ли_найден}
-    # Это позволяет избежать двойного цикла.
-    # Мы предполагаем, что пути в логе абсолютные и содержат уникальный маркер.
-    PATH_MARKER = '#OLD_FILMS/'
-
-    normalized_map_paths = set()
-    with Progress(console=console, transient=True) as progress:
-        task = progress.add_task("[green]Нормализация путей из лога...", total=len(map_source_paths))
-        for map_path in map_source_paths:
-            if PATH_MARKER in map_path:
-                normalized_map_paths.add(map_path.split(PATH_MARKER, 1)[1])
-            progress.update(task, advance=1)
-
+    # --- 2. БЫСТРОЕ И НАДЕЖНОЕ СРАВНЕНИЕ ---
     console.print("Сравнение...")
-    # Теперь сравнение - это простое вычитание одного множества из другого, что очень быстро.
-    missing_from_map_paths = set(plan_data.keys()) - normalized_map_paths
-    # <<< КОНЕЦ ИСПРАВЛЕННОГО БЛОКА >>>
 
-    # 3. Вывод результатов
+    # Нормализуем пути из маппинга, убирая возможный префикс
+    # (Это самый важный шаг)
+    PATH_MARKER = '#OLD_FILMS/'
+    normalized_mapped_sources = set()
+    for path in mapped_source_paths:
+        if PATH_MARKER in path:
+            normalized_mapped_sources.add(path.split(PATH_MARKER, 1)[1])
+        else:
+            # Если маркера нет, добавляем как есть, на всякий случай
+            normalized_mapped_sources.add(path)
+
+    # Вычитаем из множества путей плана множество нормализованных путей из маппинга
+    missing_from_map_paths = set(plan_data.keys()) - normalized_mapped_sources
+
+    # --- 3. Вывод результатов ---
     table = Table(title="Отчет о сравнении")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
@@ -346,7 +345,6 @@ def handle_plan_vs_map():
     if missing_from_map_paths:
         do_save = questionary.confirm("Сохранить список отсутствующих в маппинге файлов?").ask()
         if do_save:
-            # Предлагаем два формата: простой список и готовый CSV для copeer.py
             output_format = questionary.select(
                 "В каком формате сохранить?",
                 choices=["Простой список (.txt)", "Готовый файл-задание (.csv) для copeer.py"]
@@ -359,13 +357,12 @@ def handle_plan_vs_map():
                         f.write(f"{path}\n")
                 console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
             else:
-                output_file = "remaining_from_plan.csv"
+                output_file = "remaining_for_copy.csv"
                 with open(output_file, 'w', encoding='utf-8') as f:
                     for path in sorted(list(missing_from_map_paths)):
-                        # Записываем полную оригинальную строку из файла-задания
-                        f.write(f"{plan_data[path]}\n")
+                        if path in plan_data:
+                            f.write(f"{plan_data[path]}\n")
                 console.print(f"✅ Готовый файл-задание сохранен в [bold cyan]{output_file}[/bold cyan].")
-
 def main():
     while True:
         console.rule("[bold]Меню Copeer Auditor[/bold]")
