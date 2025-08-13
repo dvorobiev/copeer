@@ -1,10 +1,9 @@
-# copeer_auditor.py (v4.4 - Fixed Rich Markup Rendering)
+# copeer_auditor.py (v4.5 - Added Plan vs. Mapping Analysis)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v4.4: Исправлена ошибка, из-за которой теги форматирования Rich (e.g., [green])
-      отображались как обычный текст в отчете верификации.
+v4.5: Добавлена функция для сравнения файла-задания и mapping-файла.
 """
 import csv
 import os
@@ -85,7 +84,6 @@ def _run_verification(stats_data):
                 missing_paths.add(path)
             progress.update(task, advance=1)
 
-    # Отображение детализированного отчета верификации
     console.rule("[bold]Отчет по верификации[/bold]")
     verification_table = Table(title="Детализация верификации по каталогам", padding=(0, 1))
     verification_table.add_column("Общий каталог", style="magenta", no_wrap=True)
@@ -102,18 +100,13 @@ def _run_verification(stats_data):
             sorted_disks = sorted(data["destinations"].items())
             for i, (disk, paths) in enumerate(sorted_disks):
                 is_any_missing = any(p in missing_paths for p in paths)
-
-                # --- ИСПРАВЛЕНИЕ: Собираем текст по частям, применяя стили ---
                 if is_any_missing:
                     dest_text.append("❌ ", style="bold red")
                 else:
                     dest_text.append("✅ ", style="bold green")
-
                 disk_name = Path(disk).name
                 dest_text.append(f"{disk_name}: ", style="green")
                 dest_text.append(f"{len(paths):,}", style="cyan")
-                # -------------------------------------------------------------
-
                 if i < len(sorted_disks) - 1:
                     dest_text.append("\n")
 
@@ -121,10 +114,8 @@ def _run_verification(stats_data):
 
     console.print(verification_table)
 
-    # Финальная сводка
     summary_table = Table(title="Итоговая сводка верификации", show_header=False)
-    summary_table.add_column(style="cyan")
-    summary_table.add_column(justify="right", style="bold")
+    summary_table.add_column(style="cyan"); summary_table.add_column(justify="right", style="bold")
     summary_table.add_row("Всего проверено файлов/архивов", f"{len(all_dest_paths):,}")
     summary_table.add_row("Найдено на диске", f"[green]{len(all_dest_paths) - len(missing_paths):,}[/green]")
     summary_table.add_row("Отсутствует на диске", f"[red]{len(missing_paths):,}[/red]")
@@ -135,115 +126,68 @@ def _run_verification(stats_data):
         if do_save:
             output_file = "physically_missing.csv"
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['missing_destination_path'])
-                for path in sorted(missing_paths):
-                    writer.writerow([path])
+                writer = csv.writer(f); writer.writerow(['missing_destination_path'])
+                for path in sorted(missing_paths): writer.writerow([path])
             console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
 
 
 def handle_stats_and_verify():
-    """Отображает статистику и предлагает запустить верификацию."""
     console.rule("[bold magenta]Аудит и верификация по mapping-файлу[/bold magenta]")
-    map_file_path = questionary.path(
-        "Укажите путь к mapping.csv файлу:",
-        completer=path_completer,
-        validate=lambda p: os.path.exists(p) or "Файл не найден"
-    ).ask()
+    map_file_path = questionary.path("Укажите путь к mapping.csv файлу:", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not map_file_path: return
 
     try:
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             rows = [row for row in csv.reader(f) if len(row) >= 2]
             if not rows or len(rows) < 2:
-                console.print("[yellow]Файл маппинга пуст или содержит только заголовок.[/yellow]")
-                return
+                console.print("[yellow]Файл маппинга пуст или содержит только заголовок.[/yellow]"); return
             header = rows.pop(0)
     except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]")
-        return
+        console.print(f"[bold red]Не удалось прочитать файл: {e}[/bold red]"); return
 
-    # 1. Сбор и структурирование данных
-    source_paths = {row[0] for row in rows}
-    dest_paths = {row[1] for row in rows}
-
+    source_paths = {row[0] for row in rows}; dest_paths = {row[1] for row in rows}
     norm_source_dirs = {normalize_directory_path(os.path.dirname(p)) for p in source_paths}
     all_unique_norm_dirs = sorted(list(norm_source_dirs))
-
-    # {norm_dir: {"in_source": bool, "destinations": {disk: [path1, path2]}}}
     stats_data = defaultdict(lambda: {"in_source": False, "destinations": defaultdict(list)})
-
-    for p in source_paths:
-        stats_data[normalize_directory_path(os.path.dirname(p))]["in_source"] = True
-
+    for p in source_paths: stats_data[normalize_directory_path(os.path.dirname(p))]["in_source"] = True
     for p in dest_paths:
         norm_dir = normalize_directory_path(os.path.dirname(p))
-        parts = Path(p).parts
-        disk = f"/{parts[1]}/{parts[2]}" if len(parts) > 2 and parts[1] == 'mnt' else "unknown"
+        parts = Path(p).parts; disk = f"/{parts[1]}/{parts[2]}" if len(parts) > 2 and parts[1] == 'mnt' else "unknown"
         stats_data[norm_dir]["destinations"][disk].append(p)
 
-    # 2. Вывод статистики
-    console.clear()
-    console.rule(f"[bold]Статистика для [cyan]{os.path.basename(map_file_path)}[/cyan][/bold]")
-
-    summary_text = (
-        f"Обработано записей (исходных файлов): [cyan]{len(rows):,}[/cyan]\n"
-        f"Создано физических файлов/архивов: [green bold]{len(dest_paths):,}[/green bold]"
-    )
+    console.clear(); console.rule(f"[bold]Статистика для [cyan]{os.path.basename(map_file_path)}[/cyan][/bold]")
+    summary_text = (f"Обработано записей (исходных файлов): [cyan]{len(rows):,}[/cyan]\n" f"Создано физических файлов/архивов: [green bold]{len(dest_paths):,}[/green bold]")
     console.print(Panel(summary_text, title="Общая сводка", border_style="dim"))
 
     stats_table = Table(title="Детализация по каталогам и дискам", padding=(0, 1))
-    stats_table.add_column("Общий каталог", style="magenta", no_wrap=True)
-    stats_table.add_column("Источник", justify="center")
-    stats_table.add_column("Назначение", justify="left")
-
+    stats_table.add_column("Общий каталог", style="magenta", no_wrap=True); stats_table.add_column("Источник", justify="center"); stats_table.add_column("Назначение", justify="left")
     for norm_dir in all_unique_norm_dirs:
-        data = stats_data[norm_dir]
-        in_source = "[green]✅[/green]" if data["in_source"] else "[red]❌[/red]"
-
+        data = stats_data[norm_dir]; in_source = "[green]✅[/green]" if data["in_source"] else "[red]❌[/red]"
         dest_text = Text()
-        if not data["destinations"]:
-            dest_text.append("❌", style="red")
+        if not data["destinations"]: dest_text.append("❌", style="red")
         else:
             sorted_disks = sorted(data["destinations"].items())
             for i, (disk, paths) in enumerate(sorted_disks):
-                disk_name = Path(disk).name
-                dest_text.append(f"{disk_name}: ", style="green")
-                dest_text.append(f"{len(paths):,}", style="cyan")
-                if i < len(sorted_disks) - 1:
-                    dest_text.append("\n")
-
+                disk_name = Path(disk).name; dest_text.append(f"{disk_name}: ", style="green"); dest_text.append(f"{len(paths):,}", style="cyan")
+                if i < len(sorted_disks) - 1: dest_text.append("\n")
         stats_table.add_row(norm_dir, in_source, dest_text)
-
     console.print(stats_table)
 
-    # 3. Предложение верифицировать
-    do_verify = questionary.confirm("Хотите верифицировать эти файлы?", default=False).ask()
-    if do_verify:
-        _run_verification(stats_data)
+    if questionary.confirm("Хотите верифицировать эти файлы?", default=False).ask(): _run_verification(stats_data)
+
 
 def handle_merge():
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
-    maps_dir_path = questionary.path(
-        "Укажите путь к директории с mapping-файлами:",
-        completer=dir_completer,
-        validate=lambda p: os.path.isdir(p) or "Директория не найдена"
-    ).ask()
+    maps_dir_path = questionary.path("Укажите путь к директории с mapping-файлами:", completer=dir_completer, validate=lambda p: os.path.isdir(p) or "Директория не найдена").ask()
     if not maps_dir_path: return
-
-    maps_dir = Path(maps_dir_path)
 
     pattern = questionary.text("Укажите шаблон для поиска файлов:", default="mapping*.csv").ask()
     if not pattern: return
 
-    map_files = sorted(list(maps_dir.glob(pattern)))
-
-    if not map_files:
-        console.print(f"[bold red]Файлы по шаблону '{pattern}' в директории '{maps_dir_path}' не найдены.[/bold red]")
-        return
+    map_files = sorted(list(Path(maps_dir_path).glob(pattern)))
+    if not map_files: console.print(f"[bold red]Файлы по шаблону '{pattern}' не найдены.[/bold red]"); return
 
     console.print(f"\nНайдено {len(map_files)} файлов для анализа слияния...")
-
     all_unique_mappings, file_stats = set(), []
     for file_path in map_files:
         try:
@@ -254,59 +198,34 @@ def handle_merge():
                     rows = [tuple(row) for row in reader if len(row) >= 2]
                     file_stats.append((file_path.name, len(rows)))
                     all_unique_mappings.update(rows)
-                except StopIteration:
-                    file_stats.append((file_path.name, 0))
-        except Exception as e:
-            console.print(f"[yellow]Предупреждение: Не удалось прочитать {file_path}: {e}[/yellow]")
+                except StopIteration: file_stats.append((file_path.name, 0))
+        except Exception as e: console.print(f"[yellow]Предупреждение: Не удалось прочитать {file_path}: {e}[/yellow]")
 
-    summary_table = Table(title="Аналитика по mapping-файлам")
-    summary_table.add_column("Имя файла", style="green", no_wrap=True)
-    summary_table.add_column("Количество записей", justify="right")
-    for name, count in file_stats:
-        summary_table.add_row(name, f"{count:,}")
-    summary_table.add_section()
-    summary_table.add_row("[bold]Всего уникальных записей[/bold]", f"[bold cyan]{len(all_unique_mappings):,}[/bold cyan]")
+    summary_table = Table(title="Аналитика по mapping-файлам"); summary_table.add_column("Имя файла", style="green", no_wrap=True); summary_table.add_column("Количество записей", justify="right")
+    for name, count in file_stats: summary_table.add_row(name, f"{count:,}")
+    summary_table.add_section(); summary_table.add_row("[bold]Всего уникальных записей[/bold]", f"[bold cyan]{len(all_unique_mappings):,}[/bold cyan]")
     console.print(summary_table)
 
-    output_filename = "mapping_master.csv"
-    output_filepath = maps_dir / output_filename
-
-    do_save = questionary.confirm(f"Сохранить {len(all_unique_mappings):,} записей в файл '{output_filepath}'?").ask()
-    if not do_save:
-        console.print("[yellow]Слияние отменено пользователем.[/yellow]")
-        return
-
-    sorted_mappings = sorted(list(all_unique_mappings))
-    with open(output_filepath, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['source_path', 'destination_path'])
-        writer.writerows(sorted_mappings)
-    console.print(f"✅ Успешно сохранено в: [bold cyan]{output_filepath}[/bold cyan]")
+    output_filepath = Path(maps_dir_path) / "mapping_master.csv"
+    if questionary.confirm(f"Сохранить {len(all_unique_mappings):,} записей в файл '{output_filepath}'?").ask():
+        sorted_mappings = sorted(list(all_unique_mappings))
+        with open(output_filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f); writer.writerow(['source_path', 'destination_path']); writer.writerows(sorted_mappings)
+        console.print(f"✅ Успешно сохранено в: [bold cyan]{output_filepath}[/bold cyan]")
+    else: console.print("[yellow]Слияние отменено пользователем.[/yellow]")
 
 
 def handle_analyze():
-    console.rule("[bold yellow]2. Анализ полноты копирования[/bold yellow]")
-    source_list_path = questionary.path(
-        "Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов:",
-        completer=path_completer,
-        validate=lambda p: os.path.exists(p) or "Файл не найден"
-    ).ask()
+    console.rule("[bold yellow]2. Найти недокопированные файлы[/bold yellow]")
+    source_list_path = questionary.path("Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов:", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not source_list_path: return
-
-    state_file_path = questionary.path(
-        "Укажите путь к файлу состояния (copier_state.csv):",
-        completer=path_completer,
-        validate=lambda p: os.path.exists(p) or "Файл не найден"
-    ).ask()
+    state_file_path = questionary.path("Укажите путь к файлу состояния (copier_state.csv):", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not state_file_path: return
 
     try:
-        with open(state_file_path, 'r', encoding='utf-8') as f:
-            processed_files_abs = {row[0] for row in csv.reader(f) if row}
+        with open(state_file_path, 'r', encoding='utf-8') as f: processed_files_abs = {row[0] for row in csv.reader(f) if row}
         console.print(f"Загружено [bold]{len(processed_files_abs):,}[/bold] записей из файла состояния.")
-    except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать state-файл: {e}[/bold red]")
-        return
+    except Exception as e: console.print(f"[bold red]Не удалось прочитать state-файл: {e}[/bold red]"); return
 
     console.print("Анализ исходного списка...")
     source_list_paths_rel, source_data_map = [], {}
@@ -317,27 +236,17 @@ def handle_analyze():
                 if not row or len(row) < 5 or 'directory' in row[1]: continue
                 rel_path_str = row[0]
                 source_list_paths_rel.append(rel_path_str)
-                source_data_map[rel_path_str] = [rel_path_str, 'file', parse_scientific_notation(row[4]), '', row[4]]
-    except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать исходный список: {e}[/bold red]")
-        return
+                source_data_map[rel_path_str] = row
+    except Exception as e: console.print(f"[bold red]Не удалось прочитать исходный список: {e}[/bold red]"); return
 
-    console.print("Интеллектуальное определение `source_root`...")
-    source_root = find_source_root(processed_files_abs, source_list_paths_rel)
-
-    if source_root:
-        console.print(f"✅ Автоматически определен `source_root`: [cyan]{source_root}[/cyan]")
-    else:
-        console.print("[bold yellow]Не удалось определить `source_root` автоматически.[/bold yellow]")
-        source_root = ""
+    console.print("Интеллектуальное определение `source_root`..."); source_root = find_source_root(processed_files_abs, source_list_paths_rel)
+    if source_root: console.print(f"✅ Автоматически определен `source_root`: [cyan]{source_root}[/cyan]")
+    else: console.print("[bold yellow]Не удалось определить `source_root` автоматически.[/bold yellow]"); source_root = ""
 
     intended_files_abs = {os.path.normpath(os.path.join(source_root, p.lstrip('./'))) for p in source_list_paths_rel}
-
     missing_files_abs = sorted(list(intended_files_abs - processed_files_abs))
 
-    table = Table(title="Отчет по анализу")
-    table.add_column("Параметр", style="cyan")
-    table.add_column("Количество", justify="right", style="white")
+    table = Table(title="Отчет по анализу"); table.add_column("Параметр", style="cyan"); table.add_column("Количество", justify="right", style="white")
     table.add_row("Всего файлов в исходном списке", f"{len(intended_files_abs):,}")
     table.add_row("[green]Успешно обработано (есть в state-файле)[/green]", f"{len(intended_files_abs) - len(missing_files_abs):,}")
     table.add_row("[red]Не обработано (отсутствуют в state-файле)[/red]", f"{len(missing_files_abs):,}")
@@ -351,18 +260,88 @@ def handle_analyze():
             for abs_path in missing_files_abs:
                 rel_path = os.path.relpath(abs_path, source_root) if source_root else abs_path
                 rel_path_unix = rel_path.replace(os.path.sep, '/')
-
                 original_rel_path = None
-                if rel_path_unix in source_data_map:
-                    original_rel_path = rel_path_unix
-                elif f"./{rel_path_unix}" in source_data_map:
-                    original_rel_path = f"./{rel_path_unix}"
-
-                if original_rel_path:
-                    writer.writerow(source_data_map[original_rel_path])
+                if rel_path_unix in source_data_map: original_rel_path = rel_path_unix
+                elif f"./{rel_path_unix}" in source_data_map: original_rel_path = f"./{rel_path_unix}"
+                if original_rel_path: writer.writerow(source_data_map[original_rel_path])
         console.print(f"✅ Готово. Используйте [bold]'{output_file}'[/bold] как --input-file для copeer.py.")
-    else:
-        console.print("\n[bold green]✅ Отлично! Все файлы из исходного списка были обработаны.[/bold green]")
+    else: console.print("\n[bold green]✅ Отлично! Все файлы из исходного списка были обработаны.[/bold green]")
+
+
+# <<< НОВАЯ ФУНКЦИЯ >>>
+def handle_plan_vs_map():
+    """Сравнивает файл-задание и mapping-файл."""
+    console.rule("[bold green]4. Сравнение файла задания и mapping-файла[/bold green]")
+
+    # 1. Получение путей к файлам
+    plan_file_path = questionary.path(
+        "Укажите путь к файлу ЗАДАНИЯ (например, group_2.csv):",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not plan_file_path: return
+
+    map_file_path = questionary.path(
+        "Укажите путь к MAPPING-файлу (например, mapping_master.csv):",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not map_file_path: return
+
+    # 2. Загрузка данных
+    try:
+        console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
+        with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # Читаем первую колонку до ';'
+            plan_paths = {row.strip().split(';')[0] for row in f if row.strip()}
+    except Exception as e:
+        console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
+
+    try:
+        console.print(f"Загрузка mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
+        with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.reader(f)
+            next(reader, None) # Пропускаем заголовок
+            # Читаем первую колонку (source_path)
+            map_source_paths = {row[0] for row in reader if len(row) >= 1}
+    except Exception as e:
+        console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]"); return
+
+    # <<< ОСНОВНАЯ ЛОГИКА СРАВНЕНИЯ >>>
+    # Находим пути, которые есть в плане, но отсутствуют в маппинге
+    # Важно: нужно нормализовать пути из маппинга, если они абсолютные
+    # Предполагаем, что copeer.py пишет полные пути, а в задании - относительные
+    # Для этого ищем совпадение по конечной части пути
+
+    console.print("Сравнение...")
+    missing_from_map = set()
+    for plan_path in plan_paths:
+        found_in_map = False
+        for map_path in map_source_paths:
+            if map_path.endswith(plan_path):
+                found_in_map = True
+                break
+        if not found_in_map:
+            missing_from_map.add(plan_path)
+
+    # 3. Вывод результатов
+    table = Table(title="Отчет о сравнении")
+    table.add_column("Параметр", style="cyan")
+    table.add_column("Количество", justify="right", style="white")
+    table.add_row("Всего файлов в задании", f"{len(plan_paths):,}")
+    table.add_row("[green]Найдено в mapping-файле[/green]", f"{len(plan_paths) - len(missing_from_map):,}")
+    table.add_row("[red]Отсутствует в mapping-файле[/red]", f"{len(missing_from_map):,}")
+    console.print(table)
+
+    if missing_from_map:
+        do_save = questionary.confirm("Сохранить список отсутствующих в маппинге файлов?").ask()
+        if do_save:
+            output_file = "plan_missing_in_map.txt"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for path in sorted(list(missing_from_map)):
+                    f.write(f"{path}\n")
+            console.print(f"✅ Список сохранен в [bold cyan]{output_file}[/bold cyan].")
+
 
 def main():
     while True:
@@ -371,8 +350,10 @@ def main():
             "Выберите действие:",
             choices=[
                 "1. Склеить `mapping` файлы",
-                "2. Найти недокопированные файлы",
-                "3. Аудит и верификация по `mapping` файлу",
+                "2. Найти недокопированные файлы (по state-файлу)",
+                "3. Аудит и верификация (по mapping-файлу)",
+                # <<< НОВЫЙ ПУНКТ МЕНЮ >>>
+                "4. Сравнить план и `mapping` (найти что не в логе)",
                 questionary.Separator(),
                 "Выход"
             ],
@@ -380,17 +361,15 @@ def main():
         ).ask()
 
         if choice is None or choice == "Выход":
-            console.print("[bold green]Выход.[/bold green]")
-            break
+            console.print("[bold green]Выход.[/bold green]"); break
 
         console.clear()
 
-        if "1." in choice:
-            handle_merge()
-        elif "2." in choice:
-            handle_analyze()
-        elif "3." in choice:
-            handle_stats_and_verify()
+        if "1." in choice: handle_merge()
+        elif "2." in choice: handle_analyze()
+        elif "3." in choice: handle_stats_and_verify()
+        # <<< ОБРАБОТЧИК НОВОГО ПУНКТА >>>
+        elif "4." in choice: handle_plan_vs_map()
 
         questionary.press_any_key_to_continue("Нажмите любую клавишу для возврата в меню...").ask()
         console.clear()
