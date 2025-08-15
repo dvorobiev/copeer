@@ -396,25 +396,30 @@ def handle_filter_map_by_plan():
         completer=path_completer,
         validate=lambda p: os.path.exists(p) or "Файл не найден"
     ).ask()
-    if not plan_file_path: return
+    if not plan_file_path:
+        return
 
     map_file_path = questionary.path(
         "Укажите путь к MAPPING-файлу (который будем фильтровать):",
         completer=path_completer,
         validate=lambda p: os.path.exists(p) or "Файл не найден"
     ).ask()
-    if not map_file_path: return
+    if not map_file_path:
+        return
 
-    # --- 1. Загрузка файла-задания (плана) ---
+    # --- 1. Загружаем и нормализуем пути из файла задания ---
     plan_relative_paths = set()
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
         with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 if line.strip():
-                    plan_relative_paths.add(line.strip().split(';')[0])
+                    rel_path = line.strip().split(';')[0]
+                    norm_rel = normalize_source_path_for_comparison(rel_path) or rel_path
+                    plan_relative_paths.add(norm_rel)
     except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
+        console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]")
+        return
 
     # --- 2. Загрузка и фильтрация mapping-файла ---
     kept_rows = []
@@ -425,24 +430,22 @@ def handle_filter_map_by_plan():
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
-                 console.print(f"[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
+                console.print("[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]")
+                return
 
             for row in reader:
+                if len(row) < 1:
+                    continue
                 original_map_count += 1
-                if len(row) < 1: continue
-
-                source_path = row[0]
-                # Используем нашу новую универсальную функцию для нормализации
-                normalized_path = normalize_source_path_for_comparison(source_path)
-
-                # Если нормализованный путь есть в нашем задании, сохраняем всю строку
-                if normalized_path in plan_relative_paths:
+                source_path = row
+                norm_src = normalize_source_path_for_comparison(source_path) or source_path
+                if norm_src in plan_relative_paths:
                     kept_rows.append(row)
-
     except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]"); return
+        console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]")
+        return
 
-    # --- 3. Вывод результатов и сохранение ---
+    # --- 3. Вывод результатов ---
     table = Table(title="Отчет о фильтрации")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
@@ -452,9 +455,12 @@ def handle_filter_map_by_plan():
     table.add_row("[yellow]Будет удалено записей[/yellow]", f"{original_map_count - len(kept_rows):,}")
     console.print(table)
 
+    # --- 4. Сохранение ---
     if kept_rows:
         output_filename = f"{Path(map_file_path).stem}_filtered.csv"
-        do_save = questionary.confirm(f"Сохранить отфильтрованные записи в новый файл '{output_filename}'?").ask()
+        do_save = questionary.confirm(
+            f"Сохранить отфильтрованные записи в новый файл '{output_filename}'?"
+        ).ask()
         if do_save:
             try:
                 with open(output_filename, 'w', newline='', encoding='utf-8') as f:
