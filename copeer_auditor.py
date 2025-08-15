@@ -66,38 +66,36 @@ def find_source_root(state_file_paths, source_list_paths):
 
 # <<< ЗАМЕНИТЕ СТАРУЮ ФУНКЦИЮ НА ЭТУ ИСПРАВЛЕННУЮ ВЕРСΙЮ >>>
 
+# <<< ЗАМЕНИТЕ СТАРУЮ ФУНКЦИЮ НА ЭТУ НОВУЮ ВЕРСИЮ >>>
+
 def normalize_source_path_for_comparison(source_path_str: str) -> str:
     """
     Нормализует абсолютный путь из mapping-файла для сравнения с относительным путем из файла-задания.
     Ищет '/raidix/' и берет все, что идет после следующего компонента.
     Пример: /mnt/cifs/raidix/#OLD_FILMS/path/to/file -> path/to/file
     """
-    # Ищем '/raidix/' как явный разделитель каталогов, чтобы избежать
-    # ложных срабатываний на файлах или папках с именем 'raidix'
+    if not isinstance(source_path_str, str):
+        return "" # Защита от передачи не-строк
+
     search_marker = '/raidix/'
     try:
         marker_pos = source_path_str.find(search_marker)
         if marker_pos != -1:
-            # Обрезаем путь, начиная с 'raidix/'
-            # Пример: 'raidix/#OLD_FILMS/path/to/file'
-            path_after_marker = source_path_str[marker_pos + len(search_marker):]
+            # Обрезаем все до конца '/raidix/'
+            # path_after_raidix -> '#OLD_FILMS/path/to/file'
+            path_after_raidix = source_path_str[marker_pos + len(search_marker):]
 
-            # Разделяем оставшийся путь на части
-            parts = path_after_marker.split('/', 1)
-
-            # Если после имени проекта (например, #OLD_FILMS) есть что-то еще,
-            # то возвращаем эту вторую часть.
-            if len(parts) > 1:
-                return parts[1]
+            # Ищем первый разделитель '/'
+            first_slash_pos = path_after_raidix.find('/')
+            if first_slash_pos != -1:
+                # Возвращаем все, что идет ПОСЛЕ первого разделителя
+                # path_after_raidix[first_slash_pos + 1:] -> 'path/to/file'
+                return path_after_raidix[first_slash_pos + 1:]
     except Exception:
-        # В случае любой ошибки, возвращаем пустую строку, чтобы
-        # гарантированно не было ложного совпадения.
-        return ""
+        return "" # В случае любой ошибки - отбраковываем
 
-    # Если маркер не найден или после него нет нужных частей,
-    # возвращаем пустую строку.
+    # Если путь не соответствует формату, отбраковываем его
     return ""
-
 # --- Основные функции команд ---
 
 def _run_verification(stats_data):
@@ -387,6 +385,8 @@ def handle_plan_vs_map():
                 console.print(f"✅ Готовый файл-задание сохранен в [bold cyan]{output_file}[/bold cyan].")
 
 
+# <<< ЗАМЕНИТЕ ВСЮ ВАШУ ФУНКЦИЮ handle_filter_map_by_plan НА ЭТУ >>>
+
 def handle_filter_map_by_plan():
     """Фильтрует mapping-файл, оставляя только записи, присутствующие в файле-задании."""
     console.rule("[bold blue]5. Фильтровать `mapping` по файлу-заданию[/bold blue]")
@@ -396,30 +396,26 @@ def handle_filter_map_by_plan():
         completer=path_completer,
         validate=lambda p: os.path.exists(p) or "Файл не найден"
     ).ask()
-    if not plan_file_path:
-        return
+    if not plan_file_path: return
 
     map_file_path = questionary.path(
         "Укажите путь к MAPPING-файлу (который будем фильтровать):",
         completer=path_completer,
         validate=lambda p: os.path.exists(p) or "Файл не найден"
     ).ask()
-    if not map_file_path:
-        return
+    if not map_file_path: return
 
-    # --- 1. Загружаем и нормализуем пути из файла задания ---
+    # --- 1. Загрузка файла-задания (плана) ---
     plan_relative_paths = set()
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
         with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 if line.strip():
-                    rel_path = line.strip().split(';')[0]
-                    norm_rel = normalize_source_path_for_comparison(rel_path) or rel_path
-                    plan_relative_paths.add(norm_rel)
+                    # Берем только первую колонку (относительный путь), как и должно быть
+                    plan_relative_paths.add(line.strip().split(';')[0])
     except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]")
-        return
+        console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
     # --- 2. Загрузка и фильтрация mapping-файла ---
     kept_rows = []
@@ -430,22 +426,26 @@ def handle_filter_map_by_plan():
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
-                console.print("[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]")
-                return
+                 console.print(f"[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
 
             for row in reader:
-                if len(row) < 1:
-                    continue
                 original_map_count += 1
-                source_path = row
-                norm_src = normalize_source_path_for_comparison(source_path) or source_path
-                if norm_src in plan_relative_paths:
-                    kept_rows.append(row)
-    except Exception as e:
-        console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]")
-        return
+                if len(row) < 1: continue
 
-    # --- 3. Вывод результатов ---
+                # ПРАВИЛЬНО: берем ПЕРВЫЙ элемент из строки CSV
+                source_path_str = row[0]
+
+                # Нормализуем его с помощью исправленной функции
+                normalized_path = normalize_source_path_for_comparison(source_path_str)
+
+                # Если нормализованный путь есть в нашем задании, сохраняем всю строку
+                if normalized_path and normalized_path in plan_relative_paths:
+                    kept_rows.append(row)
+
+    except Exception as e:
+        console.print(f"[bold red]Не удалось прочитать или обработать mapping-файл: {e}[/bold red]"); return
+
+    # --- 3. Вывод результатов и сохранение ---
     table = Table(title="Отчет о фильтрации")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
@@ -455,12 +455,9 @@ def handle_filter_map_by_plan():
     table.add_row("[yellow]Будет удалено записей[/yellow]", f"{original_map_count - len(kept_rows):,}")
     console.print(table)
 
-    # --- 4. Сохранение ---
     if kept_rows:
         output_filename = f"{Path(map_file_path).stem}_filtered.csv"
-        do_save = questionary.confirm(
-            f"Сохранить отфильтрованные записи в новый файл '{output_filename}'?"
-        ).ask()
+        do_save = questionary.confirm(f"Сохранить отфильтрованные записи в новый файл '{output_filename}'?").ask()
         if do_save:
             try:
                 with open(output_filename, 'w', newline='', encoding='utf-8') as f:
@@ -472,7 +469,6 @@ def handle_filter_map_by_plan():
                 console.print(f"[bold red]Ошибка при сохранении файла: {e}[/bold red]")
     else:
         console.print("[yellow]После фильтрации не осталось ни одной записи. Файл не будет создан.[/yellow]")
-
 
 def main():
     while True:
