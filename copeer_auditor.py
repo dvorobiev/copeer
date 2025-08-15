@@ -1,13 +1,12 @@
-# copeer_auditor.py (v5.0 - Dynamic path normalization and map filtering)
+# copeer_auditor.py (v6.0 - Hardcoded prefix for reliability)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v5.0:
-- Добавлена функция для фильтрации mapping-файла по файлу-заданию.
-- Улучшена функция сравнения плана и маппинга: теперь она автоматически
-  определяет относительный путь по маркеру 'raidix', а не по жестко
-  заданной строке.
+v6.0:
+- Для функций сравнения и фильтрации (пункты 4 и 5) используется
+  жестко заданный префикс пути для 100% надежности.
+  Сложное автоопределение удалено.
 """
 import csv
 import os
@@ -64,38 +63,7 @@ def find_source_root(state_file_paths, source_list_paths):
                 return source_root.rstrip('/')
     return None
 
-# <<< ЗАМЕНИТЕ СТАРУЮ ФУНКЦИЮ НА ЭТУ ИСПРАВЛЕННУЮ ВЕРСΙЮ >>>
 
-# <<< ЗАМЕНИТЕ СТАРУЮ ФУНКЦИЮ НА ЭТУ НОВУЮ ВЕРСИЮ >>>
-
-def normalize_source_path_for_comparison(source_path_str: str) -> str:
-    """
-    Нормализует абсолютный путь из mapping-файла для сравнения с относительным путем из файла-задания.
-    Ищет '/raidix/' и берет все, что идет после следующего компонента.
-    Пример: /mnt/cifs/raidix/#OLD_FILMS/path/to/file -> path/to/file
-    """
-    if not isinstance(source_path_str, str):
-        return "" # Защита от передачи не-строк
-
-    search_marker = '/raidix/'
-    try:
-        marker_pos = source_path_str.find(search_marker)
-        if marker_pos != -1:
-            # Обрезаем все до конца '/raidix/'
-            # path_after_raidix -> '#OLD_FILMS/path/to/file'
-            path_after_raidix = source_path_str[marker_pos + len(search_marker):]
-
-            # Ищем первый разделитель '/'
-            first_slash_pos = path_after_raidix.find('/')
-            if first_slash_pos != -1:
-                # Возвращаем все, что идет ПОСЛЕ первого разделителя
-                # path_after_raidix[first_slash_pos + 1:] -> 'path/to/file'
-                return path_after_raidix[first_slash_pos + 1:]
-    except Exception:
-        return "" # В случае любой ошибки - отбраковываем
-
-    # Если путь не соответствует формату, отбраковываем его
-    return ""
 # --- Основные функции команд ---
 
 def _run_verification(stats_data):
@@ -304,8 +272,14 @@ def handle_analyze():
 
 
 def handle_plan_vs_map():
-    """Сравнивает файл-задание и mapping-файл, анализируя исходные пути."""
+    """Сравнивает файл-задание и mapping-файл, используя жестко заданный префикс."""
     console.rule("[bold green]4. Сравнение плана и `mapping` (по исходным путям)[/bold green]")
+
+    # --- НАСТРОЙКА ---
+    # Жестко заданный префикс для нормализации путей из маппинга.
+    # ИЗМЕНИТЕ ЭТУ СТРОКУ, ЕСЛИ КОРНЕВОЙ КАТАЛОГ ИСТОЧНИКА ДРУГОЙ.
+    SOURCE_ROOT_PREFIX = "/mnt/cifs/raidix/#OLD_FILMS/"
+    # --- КОНЕЦ НАСТРОЙКИ ---
 
     plan_file_path = questionary.path(
         "Укажите путь к файлу ЗАДАНИЯ (например, group_2.csv):",
@@ -321,7 +295,8 @@ def handle_plan_vs_map():
     ).ask()
     if not map_file_path: return
 
-    # --- 1. Загрузка данных ---
+    console.print(f"Используется жестко заданный префикс: [bold cyan]{SOURCE_ROOT_PREFIX}[/bold cyan]")
+
     plan_data = {} # {относительный_путь: полная_строка}
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
@@ -337,23 +312,21 @@ def handle_plan_vs_map():
         console.print(f"Загрузка mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f)
-            next(reader, None) # Пропускаем заголовок
+            next(reader, None)
             for row in reader:
                 if len(row) >= 1:
                     mapped_source_paths.add(row[0])
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]"); return
 
-    # --- 2. УМНОЕ И НАДЕЖНОЕ СРАВНЕНИЕ ---
     console.print("Сравнение...")
+    normalized_mapped_sources = set()
+    for path in mapped_source_paths:
+        if path.startswith(SOURCE_ROOT_PREFIX):
+            normalized_mapped_sources.add(path.removeprefix(SOURCE_ROOT_PREFIX))
 
-    # Нормализуем пути из маппинга с помощью нашей новой универсальной функции
-    normalized_mapped_sources = {normalize_source_path_for_comparison(p) for p in mapped_source_paths}
-
-    # Вычитаем из множества путей плана множество нормализованных путей из маппинга
     missing_from_map_paths = set(plan_data.keys()) - normalized_mapped_sources
 
-    # --- 3. Вывод результатов ---
     table = Table(title="Отчет о сравнении")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
@@ -385,13 +358,15 @@ def handle_plan_vs_map():
                 console.print(f"✅ Готовый файл-задание сохранен в [bold cyan]{output_file}[/bold cyan].")
 
 
-# <<< ЗАМЕНИТЕ ВСЮ ВАШУ ФУНКЦИЮ handle_filter_map_by_plan НА ЭТУ >>>
-
-# <<< ЗАМЕНИТЕ ВСЮ ВАШУ ФУНКЦИЮ handle_filter_map_by_plan НА ЭТУ >>>
-
 def handle_filter_map_by_plan():
-    """Фильтрует mapping-файл, оставляя только записи, присутствующие в файле-задании."""
+    """Фильтрует mapping-файл, используя жестко заданный префикс."""
     console.rule("[bold blue]5. Фильтровать `mapping` по файлу-заданию[/bold blue]")
+
+    # --- НАСТРОЙКА ---
+    # Жестко заданный префикс для удаления.
+    # ИЗМЕНИТЕ ЭТУ СТРОКУ, ЕСЛИ КОРНЕВОЙ КАТАЛОГ ИСТОЧНИКА ДРУГОЙ.
+    SOURCE_ROOT_PREFIX = "/mnt/cifs/raidix/#OLD_FILMS/"
+    # --- КОНЕЦ НАСТРОЙКИ ---
 
     plan_file_path = questionary.path(
         "Укажите путь к файлу ЗАДАНИЯ (по которому будем фильтровать):",
@@ -407,7 +382,8 @@ def handle_filter_map_by_plan():
     ).ask()
     if not map_file_path: return
 
-    # --- 1. Загрузка файла-задания (плана) ---
+    console.print(f"Используется жестко заданный префикс: [bold cyan]{SOURCE_ROOT_PREFIX}[/bold cyan]")
+
     plan_relative_paths = set()
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
@@ -418,74 +394,28 @@ def handle_filter_map_by_plan():
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
-    if not plan_relative_paths:
-        console.print("[red]Файл задания пуст. Фильтрация невозможна.[/red]"); return
-
-
-    # --- 2. Загрузка, АВТООПРЕДЕЛЕНИЕ ПРЕФИКСА и фильтрация ---
     kept_rows = []
     original_map_count = 0
-    source_root_prefix = None
-
     try:
-        console.print(f"Анализ и фильтрация mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
+        console.print(f"Фильтрация mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
-                 console.print(f"[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
+                console.print("[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
 
-            # Получаем первую строку с данными, чтобы определить префикс
-            first_row = next(reader, None)
-            if not first_row or len(first_row) < 1:
-                console.print("[red]Не удалось прочитать первую строку данных из mapping-файла.[/red]"); return
-
-            # --- Логика автоопределения префикса ---
-            first_source_path = first_row[0]
-            # Берем один из путей из нашего задания для поиска
-            sample_plan_path = next(iter(plan_relative_paths))
-            # Находим последнюю часть пути (имя файла или папки)
-            last_part_of_sample = Path(sample_plan_path).name
-
-            # Ищем эту часть в полном пути из маппинга
-            if last_part_of_sample in first_source_path:
-                # Нашли! Теперь "отрезаем" все после этой части
-                # Пример: /mnt/cifs/raidix/#OLD_FILMS/07.J/file.txt
-                #         ищем '07.J/file.txt'
-                #         отрезаем /mnt/cifs/raidix/#OLD_FILMS/
-                end_of_prefix_index = first_source_path.find(sample_plan_path)
-                if end_of_prefix_index != -1:
-                    source_root_prefix = first_source_path[:end_of_prefix_index]
-                    console.print(f"✅ Префикс для удаления определен автоматически: [bold cyan]{source_root_prefix}[/bold cyan]")
-
-            if not source_root_prefix:
-                console.print("[bold red]Не удалось автоматически определить общий префикс пути.[/bold red]")
-                console.print("Пример пути из задания:", sample_plan_path)
-                console.print("Пример пути из маппинга:", first_source_path)
-                return
-
-            # --- Основной цикл фильтрации ---
-            all_map_rows = [first_row] + list(reader) # Собираем все строки для обработки
-
-            for row in all_map_rows:
+            for row in reader:
                 original_map_count += 1
                 if len(row) < 1: continue
 
                 source_path_str = row[0]
-                relative_path = ""
-
-                # Просто и надежно удаляем префикс
-                if source_path_str.startswith(source_root_prefix):
-                    relative_path = source_path_str[len(source_root_prefix):]
-
-                # Если полученный относительный путь есть в задании - сохраняем
-                if relative_path in plan_relative_paths:
-                    kept_rows.append(row)
-
+                if source_path_str.startswith(SOURCE_ROOT_PREFIX):
+                    relative_path = source_path_str.removeprefix(SOURCE_ROOT_PREFIX)
+                    if relative_path in plan_relative_paths:
+                        kept_rows.append(row)
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать или обработать mapping-файл: {e}[/bold red]"); return
 
-    # --- 3. Вывод результатов и сохранение ---
     table = Table(title="Отчет о фильтрации")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
@@ -509,6 +439,8 @@ def handle_filter_map_by_plan():
                 console.print(f"[bold red]Ошибка при сохранении файла: {e}[/bold red]")
     else:
         console.print("[yellow]После фильтрации не осталось ни одной записи. Файл не будет создан.[/yellow]")
+
+
 def main():
     while True:
         console.rule("[bold]Меню Copeer Auditor[/bold]")
