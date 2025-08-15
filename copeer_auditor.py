@@ -64,29 +64,39 @@ def find_source_root(state_file_paths, source_list_paths):
                 return source_root.rstrip('/')
     return None
 
+# <<< ЗАМЕНИТЕ СТАРУЮ ФУНКЦИЮ НА ЭТУ ИСПРАВЛЕННУЮ ВЕРСΙЮ >>>
+
 def normalize_source_path_for_comparison(source_path_str: str) -> str:
     """
     Нормализует абсолютный путь из mapping-файла для сравнения с относительным путем из файла-задания.
-    Ищет 'raidix' и берет все, что идет после следующего компонента.
+    Ищет '/raidix/' и берет все, что идет после следующего компонента.
     Пример: /mnt/cifs/raidix/#OLD_FILMS/path/to/file -> path/to/file
     """
+    # Ищем '/raidix/' как явный разделитель каталогов, чтобы избежать
+    # ложных срабатываний на файлах или папках с именем 'raidix'
+    search_marker = '/raidix/'
     try:
-        p = Path(source_path_str)
-        parts = p.parts
-        # Ищем 'raidix' в компонентах пути
-        if 'raidix' in parts:
-            raidix_index = parts.index('raidix')
-            # Убеждаемся, что после raidix есть хотя бы 1 компонент (корень проекта)
-            if len(parts) > raidix_index + 1:
-                # Берем все части ПОСЛЕ корневой папки проекта (которая идет сразу за raidix)
-                relative_parts = parts[raidix_index + 2:]
-                return str(Path(*relative_parts))
-    except (ValueError, IndexError):
-        # В случае ошибки, возвращаем исходный путь, сравнение скорее всего не сработает
-        pass
-    # Если 'raidix' не найден или структура не та, возвращаем исходную строку
-    return source_path_str
+        marker_pos = source_path_str.find(search_marker)
+        if marker_pos != -1:
+            # Обрезаем путь, начиная с 'raidix/'
+            # Пример: 'raidix/#OLD_FILMS/path/to/file'
+            path_after_marker = source_path_str[marker_pos + len(search_marker):]
 
+            # Разделяем оставшийся путь на части
+            parts = path_after_marker.split('/', 1)
+
+            # Если после имени проекта (например, #OLD_FILMS) есть что-то еще,
+            # то возвращаем эту вторую часть.
+            if len(parts) > 1:
+                return parts[1]
+    except Exception:
+        # В случае любой ошибки, возвращаем пустую строку, чтобы
+        # гарантированно не было ложного совпадения.
+        return ""
+
+    # Если маркер не найден или после него нет нужных частей,
+    # возвращаем пустую строку.
+    return ""
 
 # --- Основные функции команд ---
 
