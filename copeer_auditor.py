@@ -387,6 +387,8 @@ def handle_plan_vs_map():
 
 # <<< ЗАМЕНИТЕ ВСЮ ВАШУ ФУНКЦИЮ handle_filter_map_by_plan НА ЭТУ >>>
 
+# <<< ЗАМЕНИТЕ ВСЮ ВАШУ ФУНКЦИЮ handle_filter_map_by_plan НА ЭТУ >>>
+
 def handle_filter_map_by_plan():
     """Фильтрует mapping-файл, оставляя только записи, присутствующие в файле-задании."""
     console.rule("[bold blue]5. Фильтровать `mapping` по файлу-заданию[/bold blue]")
@@ -412,34 +414,72 @@ def handle_filter_map_by_plan():
         with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 if line.strip():
-                    # Берем только первую колонку (относительный путь), как и должно быть
                     plan_relative_paths.add(line.strip().split(';')[0])
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
-    # --- 2. Загрузка и фильтрация mapping-файла ---
+    if not plan_relative_paths:
+        console.print("[red]Файл задания пуст. Фильтрация невозможна.[/red]"); return
+
+
+    # --- 2. Загрузка, АВТООПРЕДЕЛЕНИЕ ПРЕФИКСА и фильтрация ---
     kept_rows = []
     original_map_count = 0
+    source_root_prefix = None
+
     try:
-        console.print(f"Фильтрация mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
+        console.print(f"Анализ и фильтрация mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
                  console.print(f"[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
 
-            for row in reader:
+            # Получаем первую строку с данными, чтобы определить префикс
+            first_row = next(reader, None)
+            if not first_row or len(first_row) < 1:
+                console.print("[red]Не удалось прочитать первую строку данных из mapping-файла.[/red]"); return
+
+            # --- Логика автоопределения префикса ---
+            first_source_path = first_row[0]
+            # Берем один из путей из нашего задания для поиска
+            sample_plan_path = next(iter(plan_relative_paths))
+            # Находим последнюю часть пути (имя файла или папки)
+            last_part_of_sample = Path(sample_plan_path).name
+
+            # Ищем эту часть в полном пути из маппинга
+            if last_part_of_sample in first_source_path:
+                # Нашли! Теперь "отрезаем" все после этой части
+                # Пример: /mnt/cifs/raidix/#OLD_FILMS/07.J/file.txt
+                #         ищем '07.J/file.txt'
+                #         отрезаем /mnt/cifs/raidix/#OLD_FILMS/
+                end_of_prefix_index = first_source_path.find(sample_plan_path)
+                if end_of_prefix_index != -1:
+                    source_root_prefix = first_source_path[:end_of_prefix_index]
+                    console.print(f"✅ Префикс для удаления определен автоматически: [bold cyan]{source_root_prefix}[/bold cyan]")
+
+            if not source_root_prefix:
+                console.print("[bold red]Не удалось автоматически определить общий префикс пути.[/bold red]")
+                console.print("Пример пути из задания:", sample_plan_path)
+                console.print("Пример пути из маппинга:", first_source_path)
+                return
+
+            # --- Основной цикл фильтрации ---
+            all_map_rows = [first_row] + list(reader) # Собираем все строки для обработки
+
+            for row in all_map_rows:
                 original_map_count += 1
                 if len(row) < 1: continue
 
-                # ПРАВИЛЬНО: берем ПЕРВЫЙ элемент из строки CSV
                 source_path_str = row[0]
+                relative_path = ""
 
-                # Нормализуем его с помощью исправленной функции
-                normalized_path = normalize_source_path_for_comparison(source_path_str)
+                # Просто и надежно удаляем префикс
+                if source_path_str.startswith(source_root_prefix):
+                    relative_path = source_path_str[len(source_root_prefix):]
 
-                # Если нормализованный путь есть в нашем задании, сохраняем всю строку
-                if normalized_path and normalized_path in plan_relative_paths:
+                # Если полученный относительный путь есть в задании - сохраняем
+                if relative_path in plan_relative_paths:
                     kept_rows.append(row)
 
     except Exception as e:
@@ -469,7 +509,6 @@ def handle_filter_map_by_plan():
                 console.print(f"[bold red]Ошибка при сохранении файла: {e}[/bold red]")
     else:
         console.print("[yellow]После фильтрации не осталось ни одной записи. Файл не будет создан.[/yellow]")
-
 def main():
     while True:
         console.rule("[bold]Меню Copeer Auditor[/bold]")
