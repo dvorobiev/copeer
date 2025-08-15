@@ -1,9 +1,13 @@
-# copeer_auditor.py (v4.5 - Added Plan vs. Mapping Analysis)
+# copeer_auditor.py (v5.0 - Dynamic path normalization and map filtering)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v4.5: Добавлена функция для сравнения файла-задания и mapping-файла.
+v5.0:
+- Добавлена функция для фильтрации mapping-файла по файлу-заданию.
+- Улучшена функция сравнения плана и маппинга: теперь она автоматически
+  определяет относительный путь по маркеру 'raidix', а не по жестко
+  заданной строке.
 """
 import csv
 import os
@@ -59,6 +63,29 @@ def find_source_root(state_file_paths, source_list_paths):
                 source_root = abs_path_str[:end_index]
                 return source_root.rstrip('/')
     return None
+
+def normalize_source_path_for_comparison(source_path_str: str) -> str:
+    """
+    Нормализует абсолютный путь из mapping-файла для сравнения с относительным путем из файла-задания.
+    Ищет 'raidix' и берет все, что идет после следующего компонента.
+    Пример: /mnt/cifs/raidix/#OLD_FILMS/path/to/file -> path/to/file
+    """
+    try:
+        p = Path(source_path_str)
+        parts = p.parts
+        # Ищем 'raidix' в компонентах пути
+        if 'raidix' in parts:
+            raidix_index = parts.index('raidix')
+            # Убеждаемся, что после raidix есть хотя бы 1 компонент (корень проекта)
+            if len(parts) > raidix_index + 1:
+                # Берем все части ПОСЛЕ корневой папки проекта (которая идет сразу за raidix)
+                relative_parts = parts[raidix_index + 2:]
+                return str(Path(*relative_parts))
+    except (ValueError, IndexError):
+        # В случае ошибки, возвращаем исходный путь, сравнение скорее всего не сработает
+        pass
+    # Если 'raidix' не найден или структура не та, возвращаем исходную строку
+    return source_path_str
 
 
 # --- Основные функции команд ---
@@ -132,7 +159,7 @@ def _run_verification(stats_data):
 
 
 def handle_stats_and_verify():
-    console.rule("[bold magenta]Аудит и верификация по mapping-файлу[/bold magenta]")
+    console.rule("[bold magenta]3. Аудит и верификация по mapping-файлу[/bold magenta]")
     map_file_path = questionary.path("Укажите путь к mapping.csv файлу:", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not map_file_path: return
 
@@ -268,11 +295,6 @@ def handle_analyze():
     else: console.print("\n[bold green]✅ Отлично! Все файлы из исходного списка были обработаны.[/bold green]")
 
 
-# <<< НОВАЯ ФУНКЦИЯ >>>
-# <<< ЗАМЕНИТЕ ВСЮ ФУНКЦИЮ handle_plan_vs_map() НА ЭТУ >>>
-
-# <<< ЗАМЕНИТЕ ВСЮ ФУНКЦИЮ handle_plan_vs_map() НА ЭТУ >>>
-
 def handle_plan_vs_map():
     """Сравнивает файл-задание и mapping-файл, анализируя исходные пути."""
     console.rule("[bold green]4. Сравнение плана и `mapping` (по исходным путям)[/bold green]")
@@ -302,33 +324,23 @@ def handle_plan_vs_map():
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
-    # Загружаем ИСХОДНЫЕ пути из mapping-файла
     mapped_source_paths = set()
     try:
         console.print(f"Загрузка mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f)
             next(reader, None) # Пропускаем заголовок
-            # Читаем первую колонку (source_path)
             for row in reader:
                 if len(row) >= 1:
                     mapped_source_paths.add(row[0])
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]"); return
 
-    # --- 2. БЫСТРОЕ И НАДЕЖНОЕ СРАВНЕНИЕ ---
+    # --- 2. УМНОЕ И НАДЕЖНОЕ СРАВНЕНИЕ ---
     console.print("Сравнение...")
 
-    # Нормализуем пути из маппинга, убирая возможный префикс
-    # (Это самый важный шаг)
-    PATH_MARKER = '#OLD_FILMS/'
-    normalized_mapped_sources = set()
-    for path in mapped_source_paths:
-        if PATH_MARKER in path:
-            normalized_mapped_sources.add(path.split(PATH_MARKER, 1)[1])
-        else:
-            # Если маркера нет, добавляем как есть, на всякий случай
-            normalized_mapped_sources.add(path)
+    # Нормализуем пути из маппинга с помощью нашей новой универсальной функции
+    normalized_mapped_sources = {normalize_source_path_for_comparison(p) for p in mapped_source_paths}
 
     # Вычитаем из множества путей плана множество нормализованных путей из маппинга
     missing_from_map_paths = set(plan_data.keys()) - normalized_mapped_sources
@@ -363,6 +375,89 @@ def handle_plan_vs_map():
                         if path in plan_data:
                             f.write(f"{plan_data[path]}\n")
                 console.print(f"✅ Готовый файл-задание сохранен в [bold cyan]{output_file}[/bold cyan].")
+
+
+def handle_filter_map_by_plan():
+    """Фильтрует mapping-файл, оставляя только записи, присутствующие в файле-задании."""
+    console.rule("[bold blue]5. Фильтровать `mapping` по файлу-заданию[/bold blue]")
+
+    plan_file_path = questionary.path(
+        "Укажите путь к файлу ЗАДАНИЯ (по которому будем фильтровать):",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not plan_file_path: return
+
+    map_file_path = questionary.path(
+        "Укажите путь к MAPPING-файлу (который будем фильтровать):",
+        completer=path_completer,
+        validate=lambda p: os.path.exists(p) or "Файл не найден"
+    ).ask()
+    if not map_file_path: return
+
+    # --- 1. Загрузка файла-задания (плана) ---
+    plan_relative_paths = set()
+    try:
+        console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
+        with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if line.strip():
+                    plan_relative_paths.add(line.strip().split(';')[0])
+    except Exception as e:
+        console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
+
+    # --- 2. Загрузка и фильтрация mapping-файла ---
+    kept_rows = []
+    original_map_count = 0
+    try:
+        console.print(f"Фильтрация mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
+        with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                 console.print(f"[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
+
+            for row in reader:
+                original_map_count += 1
+                if len(row) < 1: continue
+
+                source_path = row[0]
+                # Используем нашу новую универсальную функцию для нормализации
+                normalized_path = normalize_source_path_for_comparison(source_path)
+
+                # Если нормализованный путь есть в нашем задании, сохраняем всю строку
+                if normalized_path in plan_relative_paths:
+                    kept_rows.append(row)
+
+    except Exception as e:
+        console.print(f"[bold red]Не удалось прочитать mapping-файл: {e}[/bold red]"); return
+
+    # --- 3. Вывод результатов и сохранение ---
+    table = Table(title="Отчет о фильтрации")
+    table.add_column("Параметр", style="cyan")
+    table.add_column("Количество", justify="right", style="white")
+    table.add_row("Всего файлов в задании для фильтрации", f"{len(plan_relative_paths):,}")
+    table.add_row("Всего записей в исходном mapping-файле", f"{original_map_count:,}")
+    table.add_row("[green]Останется записей после фильтрации[/green]", f"{len(kept_rows):,}")
+    table.add_row("[yellow]Будет удалено записей[/yellow]", f"{original_map_count - len(kept_rows):,}")
+    console.print(table)
+
+    if kept_rows:
+        output_filename = f"{Path(map_file_path).stem}_filtered.csv"
+        do_save = questionary.confirm(f"Сохранить отфильтрованные записи в новый файл '{output_filename}'?").ask()
+        if do_save:
+            try:
+                with open(output_filename, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+                    writer.writerows(kept_rows)
+                console.print(f"✅ Отфильтрованный mapping-файл сохранен в [bold cyan]{output_filename}[/bold cyan].")
+            except Exception as e:
+                console.print(f"[bold red]Ошибка при сохранении файла: {e}[/bold red]")
+    else:
+        console.print("[yellow]После фильтрации не осталось ни одной записи. Файл не будет создан.[/yellow]")
+
+
 def main():
     while True:
         console.rule("[bold]Меню Copeer Auditor[/bold]")
@@ -372,8 +467,8 @@ def main():
                 "1. Склеить `mapping` файлы",
                 "2. Найти недокопированные файлы (по state-файлу)",
                 "3. Аудит и верификация (по mapping-файлу)",
-                # <<< НОВЫЙ ПУНКТ МЕНЮ >>>
                 "4. Сравнить план и `mapping` (найти что не в логе)",
+                "5. Фильтровать `mapping` по файлу-заданию",
                 questionary.Separator(),
                 "Выход"
             ],
@@ -388,8 +483,8 @@ def main():
         if "1." in choice: handle_merge()
         elif "2." in choice: handle_analyze()
         elif "3." in choice: handle_stats_and_verify()
-        # <<< ОБРАБОТЧИК НОВОГО ПУНКТА >>>
         elif "4." in choice: handle_plan_vs_map()
+        elif "5." in choice: handle_filter_map_by_plan()
 
         questionary.press_any_key_to_continue("Нажмите любую клавишу для возврата в меню...").ask()
         console.clear()
