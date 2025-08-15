@@ -1,19 +1,18 @@
-# copeer_auditor.py (v6.1 - Added Debug Mode)
+# copeer_auditor.py (v7.0 - Added De-duplication before filtering)
 """
 Интерактивная утилита-аудитор для анализа, слияния и верификации
 результатов работы copeer.py.
 
-v6.1:
-- Добавлен режим отладки в функцию фильтрации (пункт 5), чтобы
-  показать, как именно происходит сравнение путей. Это поможет
-  диагностировать проблемы с форматом данных.
+v7.0:
+- Добавлена ключевая функция: автоматическое обнаружение и удаление
+  дубликатов по source_path в mapping-файле перед основной фильтрацией.
+  Это решает проблему некорректных результатов.
+- Режим отладки убран в пользу более надежного основного алгоритма.
 """
 import csv
 import os
-import sys
 from pathlib import Path
 from collections import defaultdict
-import random
 
 # Сторонние библиотеки
 from rich.console import Console
@@ -70,7 +69,6 @@ def find_source_root(state_file_paths, source_list_paths):
 def _run_verification(stats_data):
     """Вспомогательная функция для запуска и отображения верификации."""
     console.rule("[bold blue]Верификация файлов[/bold blue]")
-    # ... (код без изменений)
     all_dest_paths = []
     for data in stats_data.values():
         for disk_paths in data.get("destinations", {}).values():
@@ -127,7 +125,6 @@ def _run_verification(stats_data):
 
 def handle_stats_and_verify():
     console.rule("[bold magenta]3. Аудит и верификация по mapping-файлу[/bold magenta]")
-    # ... (код без изменений)
     map_file_path = questionary.path("Укажите путь к mapping.csv файлу:", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not map_file_path: return
     try:
@@ -167,7 +164,6 @@ def handle_stats_and_verify():
 
 def handle_merge():
     console.rule("[bold cyan]1. Слияние mapping-файлов[/bold cyan]")
-    # ... (код без изменений)
     maps_dir_path = questionary.path("Укажите путь к директории с mapping-файлами:", completer=dir_completer, validate=lambda p: os.path.isdir(p) or "Директория не найдена").ask()
     if not maps_dir_path: return
     pattern = questionary.text("Укажите шаблон для поиска файлов:", default="mapping*.csv").ask()
@@ -201,7 +197,6 @@ def handle_merge():
 
 def handle_analyze():
     console.rule("[bold yellow]2. Найти недокопированные файлы[/bold yellow]")
-    # ... (код без изменений)
     source_list_path = questionary.path("Укажите путь к ИСХОДНОМУ CSV со списком ВСЕХ файлов:", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not source_list_path: return
     state_file_path = questionary.path("Укажите путь к файлу состояния (copier_state.csv):", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
@@ -249,7 +244,6 @@ def handle_analyze():
 def handle_plan_vs_map():
     """Сравнивает файл-задание и mapping-файл, используя жестко заданный префикс."""
     console.rule("[bold green]4. Сравнение плана и `mapping` (по исходным путям)[/bold green]")
-    # ... (код без изменений)
     SOURCE_ROOT_PREFIX = "/mnt/cifs/raidix/#OLD_FILMS/"
     plan_file_path = questionary.path("Укажите путь к файлу ЗАДАНИЯ (например, group_2.csv):", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not plan_file_path: return
@@ -307,14 +301,13 @@ def handle_plan_vs_map():
                             f.write(f"{plan_data[path]}\n")
                 console.print(f"✅ Готовый файл-задание сохранен в [bold cyan]{output_file}[/bold cyan].")
 
+
 # <<< ИЗМЕНЕНИЯ ТОЛЬКО В ЭТОЙ ФУНКЦИИ >>>
 def handle_filter_map_by_plan():
-    """Фильтрует mapping-файл, используя жестко заданный префикс и режим отладки."""
+    """Фильтрует mapping-файл, предварительно удаляя дубликаты."""
     console.rule("[bold blue]5. Фильтровать `mapping` по файлу-заданию[/bold blue]")
 
-    # --- НАСТРОЙКА ---
     SOURCE_ROOT_PREFIX = "/mnt/cifs/raidix/#OLD_FILMS/"
-    # --- КОНЕЦ НАСТРОЙКИ ---
 
     plan_file_path = questionary.path(
         "Укажите путь к файлу ЗАДАНИЯ (по которому будем фильтровать):",
@@ -330,10 +323,9 @@ def handle_filter_map_by_plan():
     ).ask()
     if not map_file_path: return
 
-    debug_mode = questionary.confirm("Включить режим отладки (покажет первые 20 сравнений)?", default=False).ask()
-
     console.print(f"Используется жестко заданный префикс: [bold cyan]{SOURCE_ROOT_PREFIX}[/bold cyan]")
 
+    # --- 1. Загрузка файла-задания ---
     plan_relative_paths = set()
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
@@ -344,66 +336,61 @@ def handle_filter_map_by_plan():
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
-    if debug_mode:
-        console.rule("[bold yellow]Режим отладки[/bold yellow]")
-        sample_paths = random.sample(list(plan_relative_paths), min(5, len(plan_relative_paths)))
-        console.print("Примеры путей, которые ищем в задании:")
-        for p in sample_paths:
-            console.print(f"  - [green]'{p}'[/green]")
-        console.print("-" * 20)
-
-
-    kept_rows = []
-    original_map_count = 0
-    debug_count = 0
+    # --- 2. Загрузка и ДЕДУПЛИКАЦИЯ mapping-файла ---
+    header = None
+    all_map_rows = []
+    unique_map_rows = []
+    seen_source_paths = set()
+    num_duplicates = 0
     try:
-        console.print(f"Фильтрация mapping-файла: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
+        console.print(f"Анализ на дубликаты в mapping-файле: [cyan]{os.path.basename(map_file_path)}[/cyan]...")
         with open(map_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
                 console.print("[bold red]Mapping-файл пуст или не содержит заголовка.[/bold red]"); return
 
-            for row in reader:
-                original_map_count += 1
-                if len(row) < 1: continue
+            all_map_rows = list(reader)
 
-                source_path_str = row[0]
-                relative_path = ""
-                found = False
-
-                if source_path_str.startswith(SOURCE_ROOT_PREFIX):
-                    relative_path = source_path_str.removeprefix(SOURCE_ROOT_PREFIX)
-                    if relative_path in plan_relative_paths:
-                        found = True
-                        kept_rows.append(row)
-
-                if debug_mode and debug_count < 20:
-                    status = "[green]✅ НАЙДЕНО[/green]" if found else "[red]❌ НЕ НАЙДЕНО[/red]"
-                    console.print(f"\n[bold]Проверка строки {original_map_count}:[/bold]")
-                    console.print(f"  [cyan]Полный путь:[/cyan] '{source_path_str}'")
-                    if relative_path:
-                         console.print(f"  [magenta]Относительный:[/magenta] '{relative_path}'")
-                    else:
-                         console.print(f"  [yellow]Префикс не совпал, строка пропущена.[/yellow]")
-                    console.print(f"  [bold]Результат:[/bold] {status}")
-                    debug_count += 1
+        for row in all_map_rows:
+            if len(row) < 1: continue
+            source_path = row[0]
+            if source_path not in seen_source_paths:
+                seen_source_paths.add(source_path)
+                unique_map_rows.append(row)
+            else:
+                num_duplicates += 1
 
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать или обработать mapping-файл: {e}[/bold red]"); return
 
-    if debug_mode:
-        console.rule("[bold yellow]Конец отладки[/bold yellow]")
+    console.print(f"Анализ завершен. Найдено [yellow]{num_duplicates:,}[/yellow] дубликатов по `source_path`.")
 
+    rows_to_process = unique_map_rows
+
+    # --- 3. Фильтрация подготовленных данных ---
+    console.print("Фильтрация уникальных записей...")
+    kept_rows = []
+    for row in rows_to_process:
+        source_path_str = row[0]
+        if source_path_str.startswith(SOURCE_ROOT_PREFIX):
+            relative_path = source_path_str.removeprefix(SOURCE_ROOT_PREFIX)
+            if relative_path in plan_relative_paths:
+                kept_rows.append(row)
+
+    # --- 4. Вывод результатов ---
     table = Table(title="Отчет о фильтрации")
     table.add_column("Параметр", style="cyan")
     table.add_column("Количество", justify="right", style="white")
     table.add_row("Всего файлов в задании для фильтрации", f"{len(plan_relative_paths):,}")
-    table.add_row("Всего записей в исходном mapping-файле", f"{original_map_count:,}")
+    table.add_row("Всего записей в исходном mapping-файле", f"{len(all_map_rows):,}")
+    table.add_row("[yellow]Найдено и удалено дубликатов[/yellow]", f"{num_duplicates:,}")
+    table.add_row("Уникальных записей для анализа", f"{len(rows_to_process):,}")
     table.add_row("[green]Останется записей после фильтрации[/green]", f"{len(kept_rows):,}")
-    table.add_row("[yellow]Будет удалено записей[/yellow]", f"{original_map_count - len(kept_rows):,}")
+    table.add_row("[red]Будет отфильтровано (не в задании)[/red]", f"{len(rows_to_process) - len(kept_rows):,}")
     console.print(table)
 
+    # --- 5. Сохранение ---
     if kept_rows:
         output_filename = f"{Path(map_file_path).stem}_filtered.csv"
         do_save = questionary.confirm(f"Сохранить отфильтрованные записи в новый файл '{output_filename}'?").ask()
@@ -418,7 +405,6 @@ def handle_filter_map_by_plan():
                 console.print(f"[bold red]Ошибка при сохранении файла: {e}[/bold red]")
     else:
         console.print("[yellow]После фильтрации не осталось ни одной записи. Файл не будет создан.[/yellow]")
-
 
 def main():
     while True:
