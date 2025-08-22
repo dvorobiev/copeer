@@ -26,7 +26,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "5.1.0" # ОБНОВЛЕНО
+__version__ = "6.0.0" # НОВАЯ ВЕРСИЯ
 CONFIG_FILE = "config.yaml"
 status_queue = Queue()
 DEFAULT_CONFIG = {
@@ -187,7 +187,9 @@ def write_log(state_log_file, mapping_log_file, key, dest_path=None, is_dry_run=
         if not is_dry_run:
             with open(state_log_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key])
         if dest_path:
-            with open(mapping_log_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key, dest_path])
+            # В dry-run режиме пишем в dry_run_mapping_file, иначе в обычный mapping_file
+            target_mapping_file = mapping_log_file.replace('mapping.csv', 'dry_run_mapping.csv') if is_dry_run else mapping_log_file
+            with open(target_mapping_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key, dest_path])
 
 def find_sequences(dirs, config):
     all_sequences, sequence_files = [], set()
