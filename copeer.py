@@ -26,7 +26,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "5.0.1" # ИСПРАВЛЕНО
+__version__ = "6.0.0" # НОВАЯ ВЕРСИЯ
 CONFIG_FILE = "config.yaml"
 status_queue = Queue()
 DEFAULT_CONFIG = {
@@ -187,7 +187,9 @@ def write_log(state_log_file, mapping_log_file, key, dest_path=None, is_dry_run=
         if not is_dry_run:
             with open(state_log_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key])
         if dest_path:
-            with open(mapping_log_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key, dest_path])
+            # В dry-run режиме пишем в dry_run_mapping_file, иначе в обычный mapping_file
+            target_mapping_file = mapping_log_file.replace('mapping.csv', 'dry_run_mapping.csv') if is_dry_run else mapping_log_file
+            with open(target_mapping_file, "a", newline='', encoding='utf-8') as f: csv.writer(f).writerow([key, dest_path])
 
 def find_sequences(dirs, config):
     all_sequences, sequence_files = [], set()
@@ -452,10 +454,9 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
         if not isinstance(e, KeyboardInterrupt):
             status_queue.put((worker_id, {"status": "[bold red]Ошибка[/bold red]", "progress": 0}))
 
-            # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ В ЛОГИРОВАНИИ ОШИБОК ---
+            # --- ТИХОЕ ЛОГИРОВАНИЕ ОШИБОК БЕЗ ВЫВОДА В КОНСОЛЬ ---
             if job['type'] == 'sequence':
                 # Если упала секвенция, логируем все её ИСХОДНЫЕ файлы
-                log.error(f"Ошибка при обработке секвенции {job['key']}: {e}")
                 error_message = f"Sequence processing failed for '{job['key']}': {e}"
                 with file_lock:
                     with open(config['error_log_file'], "a", encoding='utf-8') as f:
@@ -463,7 +464,6 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
                              f.write(f"{time.asctime()};{source_file};{error_message}\n")
             else:
                 # Если упал обычный файл, логируем его ключ, как и раньше
-                log.error(f"Ошибка при обработке {job['key']}: {e}")
                 with file_lock:
                     with open(config['error_log_file'], "a", encoding='utf-8') as f:
                         f.write(f"{time.asctime()};{job['key']};{e}\n")
@@ -480,17 +480,24 @@ def generate_summary_panel(plan, completed) -> Panel:
     table = Table(box=None, expand=True)
     table.add_column("Тип задания", style="cyan", no_wrap=True)
     table.add_column("Выполнено", style="green", justify="right")
+    table.add_column("Ошибки", style="red", justify="right")
     table.add_column("Размер", style="green", justify="right")
     s_plan, f_plan = plan.get('sequences', {}), plan.get('files', {})
     s_done, s_total = completed['sequence']['count'], s_plan.get('count', 0)
+    s_errors = completed['sequence']['errors']
     s_size_done, s_size_total = completed['sequence']['size'], s_plan.get('size', 0)
-    table.add_row("Архивация", f"{s_done} / {s_total}", f"{decimal(s_size_done)} / {decimal(s_size_total)}")
+    s_errors_text = f"[red]{s_errors}[/red]" if s_errors > 0 else "0"
+    table.add_row("Архивация", f"{s_done} / {s_total}", s_errors_text, f"{decimal(s_size_done)} / {decimal(s_size_total)}")
     f_done, f_total = completed['files']['count'], f_plan.get('count', 0)
+    f_errors = completed['files']['errors']
     f_size_done, f_size_total = completed['files']['size'], f_plan.get('size', 0)
-    table.add_row("Копирование", f"{f_done} / {f_total}", f"{decimal(f_size_done)} / {decimal(f_size_total)}")
+    f_errors_text = f"[red]{f_errors}[/red]" if f_errors > 0 else "0"
+    table.add_row("Копирование", f"{f_done} / {f_total}", f_errors_text, f"{decimal(f_size_done)} / {decimal(f_size_total)}")
     total_count_done, total_count_plan = s_done + f_done, s_total + f_total
+    total_errors = s_errors + f_errors
     total_size_done, total_size_plan = s_size_done + f_size_done, s_size_total + f_size_total
-    table.add_row("[bold]Всего[/bold]", f"[bold]{total_count_done} / {total_count_plan}[/bold]", f"[bold]{decimal(total_size_done)} / {decimal(total_size_plan)}[/bold]")
+    total_errors_text = f"[bold red]{total_errors}[/bold red]" if total_errors > 0 else "[bold]0[/bold]"
+    table.add_row("[bold]Всего[/bold]", f"[bold]{total_count_done} / {total_count_plan}[/bold]", total_errors_text, f"[bold]{decimal(total_size_done)} / {decimal(total_size_plan)}[/bold]")
     return Panel(table, title="📊 План выполнения", border_style="yellow")
 
 def generate_disks_panel(disk_manager: DiskManager, config) -> Panel:
@@ -610,7 +617,7 @@ def main(args):
         worker_stats[i] = {"status": "[grey50]Ожидание...[/grey50]", "job": None, "progress": 0}
 
     layout = make_layout()
-    completed_stats = {"sequence": {"count": 0, "size": 0}, "files": {"count": 0, "size": 0}}
+    completed_stats = {"sequence": {"count": 0, "size": 0, "errors": 0}, "files": {"count": 0, "size": 0, "errors": 0}}
     plan_summary = {
         "sequences": {"count": len(archive_jobs), "size": sum(j.get('size', 0) for j in archive_jobs)},
         "files": {"count": len(copy_jobs), "size": sum(j.get('size', 0) for j in copy_jobs)}
@@ -660,6 +667,9 @@ def main(args):
                                 for key in keys: write_log(config['state_file'], config['mapping_file'], key, path, is_dry_run)
                                 completed_stats['files']['count'] += 1; completed_stats['files']['size'] += size
                                 progress_bar.update(main_task, advance=size)
+                            else:
+                                # Увеличиваем счетчик ошибок
+                                completed_stats['files']['errors'] += 1
                         active_futures -= done_futures
 
                         layout["summary"].update(generate_summary_panel(plan_summary, completed_stats))
@@ -693,6 +703,9 @@ def main(args):
                         if job_type:
                             for key in keys: write_log(config['state_file'], config['mapping_file'], key, path, is_dry_run)
                             completed_stats['sequence']['count'] += 1; completed_stats['sequence']['size'] += size
+                        else:
+                            # Увеличиваем счетчик ошибок
+                            completed_stats['sequence']['errors'] += 1
                         progress_bar.update(main_task, advance=1)
 
     except KeyboardInterrupt:
