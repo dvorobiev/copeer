@@ -26,7 +26,7 @@ from rich.table import Table
 
 # --- Глобальные переменные и константы ---
 console = Console()
-__version__ = "5.0.1" # ИСПРАВЛЕНО
+__version__ = "5.1.0" # ОБНОВЛЕНО
 CONFIG_FILE = "config.yaml"
 status_queue = Queue()
 DEFAULT_CONFIG = {

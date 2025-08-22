@@ -1,7 +1,7 @@
 # pyproject.toml
 [project]
 name = "copeer"
-version = "1.0.0"
+version = "5.1.0"
 description = "A smart utility for parallel copying of large data volumes with a TUI dashboard and resume capability."
 authors = [
     {name = "Dmitriy Vorobiev", email = "vorobiev.dmitriy@gmailc.com"},
