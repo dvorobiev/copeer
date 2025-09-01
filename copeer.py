@@ -54,6 +54,83 @@ worker_stats = {}
 
 # --- Основные классы ---
 
+def show_sequences_paginated(archive_jobs, page_size=10):
+    """
+    Показывает секвенции с постраничным выводом.
+    Для каждой секвенции отображает: имя с полным путем, количество файлов, размер.
+    """
+    if not archive_jobs:
+        console.print("[yellow]Секвенции для архивации не найдены.[/yellow]")
+        return
+    
+    total_sequences = len(archive_jobs)
+    total_pages = math.ceil(total_sequences / page_size)
+    current_page = 1
+    
+    while True:
+        console.clear()
+        console.rule(f"[cyan]Список секвенций ({total_sequences} всего)[/cyan]")
+        
+        # Определяем диапазон для текущей страницы
+        start_idx = (current_page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_sequences)
+        
+        # Создаем таблицу для секвенций
+        table = Table(title=f"Страница {current_page} из {total_pages}", show_header=True, box=None, padding=(0, 1))
+        table.add_column("№", style="dim", width=4, justify="right")
+        table.add_column("Имя секвенции", style="cyan", no_wrap=False, ratio=3)
+        table.add_column("Файлов", style="yellow", justify="right", width=8)
+        table.add_column("Размер", style="green", justify="right", width=12)
+        
+        # Заполняем таблицу данными текущей страницы
+        for i in range(start_idx, end_idx):
+            job = archive_jobs[i]
+            sequence_name = job.get('tar_filename', os.path.basename(job['key']))
+            full_path = job['key']
+            file_count = len(job.get('source_files', []))
+            size = job.get('size', 0)
+            
+            # Отображаем полный путь, но красиво обрезаем если слишком длинный
+            display_path = full_path
+            if len(display_path) > 80:
+                display_path = "..." + display_path[-77:]
+            
+            table.add_row(
+                str(i + 1),
+                f"[bold]{sequence_name}[/bold]\n[dim]{display_path}[/dim]",
+                f"{file_count:,}",
+                decimal(size)
+            )
+        
+        console.print(table)
+        
+        # Показываем навигационное меню
+        choices = []
+        prompt_parts = []
+        
+        if current_page > 1:
+            choices.append("p")
+            prompt_parts.append("([cyan]P[/cyan])revious")
+        
+        if current_page < total_pages:
+            choices.append("n")
+            prompt_parts.append("([cyan]N[/cyan])ext")
+        
+        choices.append("q")
+        prompt_parts.append("([red]Q[/red])uit")
+        
+        prompt_text = "\n[bold]" + " / ".join(prompt_parts) + "[/bold]"
+        
+        choice = Prompt.ask(prompt_text, choices=choices, default="q").lower()
+        
+        if choice == 'p' and current_page > 1:
+            current_page -= 1
+        elif choice == 'n' and current_page < total_pages:
+            current_page += 1
+        elif choice == 'q':
+            console.clear()
+            break
+
 # Замените этот класс целиком
 class DiskManager:
     """
@@ -356,6 +433,12 @@ def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
 
         choices = ["s", "q"]
         prompt_text = "\n[bold]Выберите действие: ([green]S[/green])тарт / ([red]Q[/red])uit"
+        
+        # Добавляем опцию просмотра секвенций, если они есть
+        if archive_jobs:
+            choices.append("v")
+            prompt_text += " / ([cyan]V[/cyan])iew sequences"
+        
         malformed_lines = stats.get('malformed_lines', [])
         if malformed_lines:
             choices.append("e")
@@ -363,6 +446,9 @@ def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
         choice = Prompt.ask(prompt_text, choices=choices, default="s").lower()
         if choice == 's': return True
         if choice == 'q': return False
+        if choice == 'v' and archive_jobs:
+            show_sequences_paginated(archive_jobs)
+            console.clear()
         if choice == 'e' and malformed_lines:
             console.print("\n[bold yellow]----- Список некорректных строк (первые 50) -----[/bold yellow]")
             for num, line, reason in malformed_lines[:50]: console.print(f"[dim]Строка #{num} ({reason}):[/dim] {line}")
