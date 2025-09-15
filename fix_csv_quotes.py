@@ -22,6 +22,10 @@ def clean_quotes_in_path(path: str) -> str:
     # Заменяем двойные кавычки на правильные
     path = path.replace('""', '"')
     
+    # Если в пути есть проблемные кавычки в конце, убираем их
+    if path.endswith('"'):
+        path = path.rstrip('"')
+    
     return path
 
 def fix_csv_file(input_file: str, output_file: str):
