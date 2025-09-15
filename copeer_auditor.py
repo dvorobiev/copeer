@@ -20,6 +20,7 @@ from rich.table import Table
 from rich.progress import Progress
 from rich.panel import Panel
 from rich.text import Text
+import yaml
 
 # Библиотека для интерактивности
 import questionary
@@ -28,6 +29,42 @@ from prompt_toolkit.completion import PathCompleter
 console = Console()
 path_completer = PathCompleter(expanduser=True, only_directories=False)
 dir_completer = PathCompleter(expanduser=True, only_directories=True)
+
+# Константы для конфигурации
+CONFIG_FILE = "config.yaml"
+DEFAULT_CONFIG = {
+    'mount_points': ["/mnt/disk1", "/mnt/disk2"],
+    'source_root': '/path/to/source/data',
+    'destination_root': '/',
+    'threshold': 98.0,
+    'state_file': "copier_state.csv",
+    'mapping_file': "mapping.csv",
+    'error_log_file': "errors.log",
+    'dry_run_mapping_file': "dry_run_mapping.csv",
+    'threads': 8,
+    'disk_strategy': "round_robin",
+    'max_concurrent_disks': "2",
+    'min_files_for_sequence': 50,
+    'image_extensions': ['dpx', 'cri', 'tiff', 'tif', 'exr', 'png', 'jpg', 'jpeg', 'tga', 'j2c'],
+}
+
+
+# --- Загрузка конфигурации ---
+
+def load_config():
+    """Загружает конфигурацию из config.yaml или создает файл с настройками по умолчанию."""
+    config = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config.update(yaml.safe_load(f) or {})
+        except Exception as e:
+            console.print(f"[bold red]Ошибка чтения {CONFIG_FILE}: {e}.[/bold red]")
+    else:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            yaml.dump(DEFAULT_CONFIG, f, sort_keys=False, allow_unicode=True)
+        console.print(f"[yellow]Создан файл конфигурации по умолчанию: [cyan]{CONFIG_FILE}[/cyan][/yellow]")
+    return config
 
 
 # --- Вспомогательные функции ---
@@ -242,14 +279,17 @@ def handle_analyze():
     else: console.print("\n[bold green]✅ Отлично! Все файлы из исходного списка были обработаны.[/bold green]")
 
 def handle_plan_vs_map():
-    """Сравнивает файл-задание и mapping-файл, используя жестко заданный префикс."""
+    """Сравнивает файл-задание и mapping-файл, используя префикс из конфигурации."""
     console.rule("[bold green]4. Сравнение плана и `mapping` (по исходным путям)[/bold green]")
-    SOURCE_ROOT_PREFIX = "/mnt/cifs/raidix/#OLD_FILMS/"
+    
+    # Загружаем конфигурацию для получения source_root
+    config = load_config()
+    source_root_prefix = config.get('source_root', '/path/to/source/data')
     plan_file_path = questionary.path("Укажите путь к файлу ЗАДАНИЯ (например, group_2.csv):", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not plan_file_path: return
     map_file_path = questionary.path("Укажите путь к MAPPING-файлу (например, mapping_master.csv):", completer=path_completer, validate=lambda p: os.path.exists(p) or "Файл не найден").ask()
     if not map_file_path: return
-    console.print(f"Используется жестко заданный префикс: [bold cyan]{SOURCE_ROOT_PREFIX}[/bold cyan]")
+    console.print(f"Используется префикс из конфигурации: [bold cyan]{source_root_prefix}[/bold cyan]")
     plan_data = {}
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
@@ -273,8 +313,8 @@ def handle_plan_vs_map():
     console.print("Сравнение...")
     normalized_mapped_sources = set()
     for path in mapped_source_paths:
-        if path.startswith(SOURCE_ROOT_PREFIX):
-            normalized_mapped_sources.add(path.removeprefix(SOURCE_ROOT_PREFIX))
+        if path.startswith(source_root_prefix):
+            normalized_mapped_sources.add(path.removeprefix(source_root_prefix))
     missing_from_map_paths = set(plan_data.keys()) - normalized_mapped_sources
     table = Table(title="Отчет о сравнении")
     table.add_column("Параметр", style="cyan")
@@ -307,7 +347,9 @@ def handle_filter_map_by_plan():
     """Фильтрует mapping-файл, предварительно удаляя дубликаты."""
     console.rule("[bold blue]5. Фильтровать `mapping` по файлу-заданию[/bold blue]")
 
-    SOURCE_ROOT_PREFIX = "/mnt/cifs/raidix/#OLD_FILMS/"
+    # Загружаем конфигурацию для получения source_root
+    config = load_config()
+    source_root_prefix = config.get('source_root', '/path/to/source/data')
 
     plan_file_path = questionary.path(
         "Укажите путь к файлу ЗАДАНИЯ (по которому будем фильтровать):",
@@ -323,7 +365,7 @@ def handle_filter_map_by_plan():
     ).ask()
     if not map_file_path: return
 
-    console.print(f"Используется жестко заданный префикс: [bold cyan]{SOURCE_ROOT_PREFIX}[/bold cyan]")
+    console.print(f"Используется префикс из конфигурации: [bold cyan]{source_root_prefix}[/bold cyan]")
 
     # --- 1. Загрузка файла-задания ---
     plan_relative_paths = set()
@@ -373,8 +415,8 @@ def handle_filter_map_by_plan():
     kept_rows = []
     for row in rows_to_process:
         source_path_str = row[0]
-        if source_path_str.startswith(SOURCE_ROOT_PREFIX):
-            relative_path = source_path_str.removeprefix(SOURCE_ROOT_PREFIX)
+        if source_path_str.startswith(source_root_prefix):
+            relative_path = source_path_str.removeprefix(source_root_prefix)
             if relative_path in plan_relative_paths:
                 kept_rows.append(row)
 
