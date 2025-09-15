@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
 }
 SEQUENCE_RE = re.compile(r'^(.*?)[\._]*(\d+)\.([a-zA-Z0-9]+)$', re.IGNORECASE)
 
-logging.basicConfig(level="DEBUG", format="%(message)s", datefmt="[%X]", handlers=[RichHandler(rich_tracebacks=True, show_path=False, console=console)])
+logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler(rich_tracebacks=True, show_path=False, console=console)])
 log = logging.getLogger("rich")
 
 file_lock = Lock()
@@ -361,30 +361,11 @@ def parse_scientific_notation(size_str: str) -> int:
 
 def normalize_unicode_quotes(path: str) -> str:
     """
-    Нормализует кавычки в путях файлов для устранения конфликтов между ASCII и Unicode кавычками.
-    Заменяет ASCII прямые кавычки на Unicode фигурные кавычки, которые используются в файловой системе.
-    Также обрабатывает случаи, когда в CSV отсутствуют открывающие кавычки.
+    Нормализует кавычки в путях файлов.
+    Заменяет фигурные Unicode кавычки на обычные ASCII кавычки.
     """
-    # Сначала заменяем ASCII прямые кавычки " на Unicode фигурные кавычки "
+    # Заменяем фигурные Unicode кавычки на обычные ASCII кавычки
     normalized = path.replace('"', '"').replace('"', '"')
-    
-    # Обработка неполных кавычек: поиск паттерна вида "Слово"
-    # где отсутствует открывающая кавычка
-    import re
-    # Поиск паттерна: любой символ кроме " после которого следует слово заканчивающееся кавычкой
-    pattern = r'([^"\w])([\w\u0400-\u04FF]+)"'
-    matches = list(re.finditer(pattern, normalized))
-    
-    # Обрабатываем совпадения с конца строки, чтобы не сбить позиции
-    for match in reversed(matches):
-        start, end = match.span()
-        prefix_char = match.group(1)  # Символ перед словом
-        word = match.group(2)  # Слово без кавычек
-        
-        # Заменяем на правильный формат с обеими кавычками
-        replacement = f'{prefix_char}"{word}"'
-        normalized = normalized[:start] + replacement + normalized[end:]
-    
     return normalized
 
 # --- Логика анализа и выполнения ---
