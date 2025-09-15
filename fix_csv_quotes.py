@@ -2,75 +2,77 @@
 # -*- coding: utf-8 -*-
 
 """
-Скрипт для исправления кавычек в CSV файлах с путями файлов.
-Исправляет пути вида 'название"' на '"название"' проверяя существование файлов в файловой системе.
+Скрипт для исправления путей в CSV файлах путем поиска реальных путей в файловой системе.
+Не придумывает кавычки, а ищет существующие файлы/директории.
 """
 
 import os
 import sys
 import csv
+import glob
 from pathlib import Path
 
-def fix_quotes_in_path(path: str) -> str:
+def find_real_path(broken_path: str) -> str:
     """
-    Исправляет проблемные кавычки в путях.
-    Конкретно для случаев вида: 'Шарика"/' -> '"Шарика"/'
+    Ищет реальный путь в файловой системе для сломанного пути.
+    Использует glob для поиска вариантов с разными кавычками.
     """
+    # Убираем все кавычки из пути
+    clean_path = broken_path.replace('"', '').replace('"', '').replace('"', '')
+    
     # Разбиваем путь на части
-    parts = path.split('/')
-    fixed_parts = []
+    parts = clean_path.split('/')
     
-    for part in parts:
-        # Исправляем части вида 'Слово"' (только закрывающая кавычка)
-        if '"' in part and not part.startswith('"'):
-            # Поиск последнего пробела перед кавычкой
-            if ' ' in part:
-                # Находим последний пробел перед словом в кавычках
-                quote_pos = part.rfind('"')
-                if quote_pos > 0:
-                    # Находим последний пробел перед закрывающей кавычкой
-                    space_pos = part.rfind(' ', 0, quote_pos)
-                    if space_pos != -1:
-                        # Вставляем открывающую кавычку после пробела
-                        fixed_part = part[:space_pos+1] + '"' + part[space_pos+1:]
-                        # Заменяем ASCII кавычки на Unicode
-                        fixed_part = fixed_part.replace('"', '"')
-                        fixed_parts.append(fixed_part)
-                    else:
-                        fixed_parts.append(part.replace('"', '"'))
-                else:
-                    fixed_parts.append(part.replace('"', '"'))
-            else:
-                fixed_parts.append(part.replace('"', '"'))
+    # Начинаем с корня и идем по частям
+    current_path = '/'
+    
+    for i, part in enumerate(parts):
+        if not part:  # пропускаем пустые части
+            continue
+            
+        # Строим путь до текущей части
+        test_path = os.path.join(current_path, part)
+        
+        if os.path.exists(test_path):
+            current_path = test_path
         else:
-            # Просто заменяем ASCII кавычки на Unicode
-            fixed_parts.append(part.replace('"', '"'))
+            # Ищем варианты с кавычками
+            parent_dir = current_path
+            if os.path.exists(parent_dir):
+                try:
+                    # Получаем список всех элементов в директории
+                    items = os.listdir(parent_dir)
+                    
+                    # Ищем совпадение по базовому имени (без кавычек)
+                    part_clean = part.replace('"', '').replace('"', '').replace('"', '')
+                    
+                    found = None
+                    for item in items:
+                        item_clean = item.replace('"', '').replace('"', '').replace('"', '')
+                        if item_clean == part_clean:
+                            found = item
+                            break
+                    
+                    if found:
+                        current_path = os.path.join(parent_dir, found)
+                    else:
+                        # Если не нашли, возвращаем что есть
+                        return broken_path
+                except (PermissionError, OSError):
+                    # Если нет доступа к директории, возвращаем что есть
+                    return broken_path
+            else:
+                return broken_path
     
-    return '/'.join(fixed_parts)
-
-def find_existing_path(original_path: str) -> str:
-    """
-    Ищет существующий путь к файлу, пробуя разные варианты.
-    """
-    # Пробуем исходный путь
-    if os.path.exists(original_path):
-        return original_path
-    
-    # Пробуем исправленный путь
-    fixed_path = fix_quotes_in_path(original_path)
-    if os.path.exists(fixed_path):
-        return fixed_path
-    
-    # Если ничего не найдено, возвращаем исправленный путь
-    return fixed_path
+    return current_path
 
 def fix_csv_file(input_file: str, output_file: str):
     """
-    Исправляет пути в CSV файле, проверяя существование файлов в файловой системе.
+    Исправляет пути в CSV файле, находя реальные пути в файловой системе.
     """
     fixed_count = 0
     total_count = 0
-    not_found_count = 0
+    found_count = 0
     
     print(f"Обрабатываем файл: {input_file}")
     print(f"Результат будет сохранен в: {output_file}")
@@ -80,7 +82,7 @@ def fix_csv_file(input_file: str, output_file: str):
          open(output_file, 'w', encoding='utf-8', newline='') as outfile:
         
         reader = csv.reader(infile, delimiter=';')
-        writer = csv.writer(outfile, delimiter=';')
+        writer = csv.writer(outfile, delimiter=';', quoting=csv.QUOTE_MINIMAL)
         
         for row_num, row in enumerate(reader, 1):
             if not row or len(row) < 1:
@@ -90,26 +92,26 @@ def fix_csv_file(input_file: str, output_file: str):
             original_path = row[0]
             total_count += 1
             
-            # Ищем правильный путь
-            correct_path = find_existing_path(original_path)
+            # Ищем правильный путь в файловой системе
+            real_path = find_real_path(original_path)
             
             # Проверяем, изменился ли путь
-            if original_path != correct_path:
+            if original_path != real_path:
                 fixed_count += 1
                 if row_num <= 5:  # Показываем первые 5 исправлений
                     print(f"Строка {row_num}:")
                     print(f"  Было:  {repr(original_path)}")
-                    print(f"  Стало: {repr(correct_path)}")
+                    print(f"  Стало: {repr(real_path)}")
                     print()
             
             # Проверяем, существует ли файл
-            if not os.path.exists(correct_path):
-                not_found_count += 1
-                if not_found_count <= 3:  # Показываем первые 3 не найденных
-                    print(f"⚠️  Файл не найден: {correct_path}")
+            if os.path.exists(real_path):
+                found_count += 1
+                if found_count <= 3:  # Показываем первые 3 найденных
+                    print(f"✅ Файл найден: {real_path}")
             
             # Записываем исправленную строку
-            row[0] = correct_path
+            row[0] = real_path
             writer.writerow(row)
             
             if row_num % 1000 == 0:
@@ -119,8 +121,8 @@ def fix_csv_file(input_file: str, output_file: str):
     print(f"📊 Статистика:")
     print(f"   Всего строк обработано: {total_count}")
     print(f"   Путей исправлено: {fixed_count}")
-    print(f"   Файлов не найдено: {not_found_count}")
-    print(f"   Процент исправлений: {(fixed_count/total_count*100):.1f}%")
+    print(f"   Файлов найдено: {found_count}")
+    print(f"   Процент найденных файлов: {(found_count/total_count*100):.1f}%")
 
 def main():
     if len(sys.argv) != 2:
