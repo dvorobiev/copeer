@@ -9,55 +9,60 @@
 import os
 import sys
 import csv
-import re
 from pathlib import Path
 
-def normalize_unicode_quotes(path: str) -> str:
+def fix_quotes_in_path(path: str) -> str:
     """
-    Нормализует кавычки в путях файлов для устранения конфликтов между ASCII и Unicode кавычками.
-    Заменяет ASCII прямые кавычки на Unicode фигурные кавычки, которые используются в файловой системе.
-    Также обрабатывает случаи, когда в CSV отсутствуют открывающие кавычки.
+    Исправляет проблемные кавычки в путях.
+    Конкретно для случаев вида: 'Шарика"/' -> '"Шарика"/'
     """
-    # Сначала заменяем ASCII прямые кавычки " на Unicode фигурные кавычки "
-    normalized = path.replace('"', '"').replace('"', '"')
+    # Разбиваем путь на части
+    parts = path.split('/')
+    fixed_parts = []
     
-    # Обработка неполных кавычек: поиск паттерна вида 'Слово"'
-    # где отсутствует открывающая кавычка
-    pattern = r'([^"\w])([\w\u0400-\u04FF]+)"'
-    matches = list(re.finditer(pattern, normalized))
+    for part in parts:
+        # Исправляем части вида 'Слово"' (только закрывающая кавычка)
+        if '"' in part and not part.startswith('"'):
+            # Поиск последнего пробела перед кавычкой
+            if ' ' in part:
+                # Находим последний пробел перед словом в кавычках
+                quote_pos = part.rfind('"')
+                if quote_pos > 0:
+                    # Находим последний пробел перед закрывающей кавычкой
+                    space_pos = part.rfind(' ', 0, quote_pos)
+                    if space_pos != -1:
+                        # Вставляем открывающую кавычку после пробела
+                        fixed_part = part[:space_pos+1] + '"' + part[space_pos+1:]
+                        # Заменяем ASCII кавычки на Unicode
+                        fixed_part = fixed_part.replace('"', '"')
+                        fixed_parts.append(fixed_part)
+                    else:
+                        fixed_parts.append(part.replace('"', '"'))
+                else:
+                    fixed_parts.append(part.replace('"', '"'))
+            else:
+                fixed_parts.append(part.replace('"', '"'))
+        else:
+            # Просто заменяем ASCII кавычки на Unicode
+            fixed_parts.append(part.replace('"', '"'))
     
-    # Обрабатываем совпадения с конца строки, чтобы не сбить позиции
-    for match in reversed(matches):
-        start, end = match.span()
-        prefix_char = match.group(1)  # Символ перед словом
-        word = match.group(2)  # Слово без кавычек
-        
-        # Заменяем на правильный формат с обеими кавычками
-        replacement = f'{prefix_char}"{word}"'
-        normalized = normalized[:start] + replacement + normalized[end:]
-    
-    return normalized
+    return '/'.join(fixed_parts)
 
 def find_existing_path(original_path: str) -> str:
     """
-    Ищет существующий путь к файлу, пробуя разные варианты нормализации кавычек.
+    Ищет существующий путь к файлу, пробуя разные варианты.
     """
     # Пробуем исходный путь
     if os.path.exists(original_path):
         return original_path
     
-    # Пробуем нормализованный путь
-    normalized_path = normalize_unicode_quotes(original_path)
-    if os.path.exists(normalized_path):
-        return normalized_path
+    # Пробуем исправленный путь
+    fixed_path = fix_quotes_in_path(original_path)
+    if os.path.exists(fixed_path):
+        return fixed_path
     
-    # Пробуем заменить все ASCII кавычки на Unicode
-    unicode_path = original_path.replace('"', '"')
-    if os.path.exists(unicode_path):
-        return unicode_path
-    
-    # Если ничего не найдено, возвращаем нормализованный путь
-    return normalized_path
+    # Если ничего не найдено, возвращаем исправленный путь
+    return fixed_path
 
 def fix_csv_file(input_file: str, output_file: str):
     """
