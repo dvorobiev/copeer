@@ -294,9 +294,13 @@ def handle_plan_vs_map():
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
         with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if line.strip():
-                    plan_data[line.strip().split(';')[0]] = line.strip()
+            reader = csv.reader(f, delimiter=';')
+            for row in reader:
+                if len(row) >= 1 and row[0].strip():
+                    full_path = row[0]
+                    if full_path.startswith(source_root_prefix):
+                        relative_path = full_path.removeprefix(source_root_prefix)
+                        plan_data[relative_path] = ';'.join(row)  # Сохраняем всю строку
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
     mapped_source_paths = set()
@@ -372,9 +376,13 @@ def handle_filter_map_by_plan():
     try:
         console.print(f"Загрузка файла задания: [cyan]{os.path.basename(plan_file_path)}[/cyan]...")
         with open(plan_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if line.strip():
-                    plan_relative_paths.add(line.strip().split(';')[0])
+            reader = csv.reader(f, delimiter=';')
+            for row in reader:
+                if len(row) >= 1 and row[0].strip():
+                    full_path = row[0]
+                    if full_path.startswith(source_root_prefix):
+                        relative_path = full_path.removeprefix(source_root_prefix)
+                        plan_relative_paths.add(relative_path)
     except Exception as e:
         console.print(f"[bold red]Не удалось прочитать файл задания: {e}[/bold red]"); return
 
