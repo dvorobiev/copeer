@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
 }
 SEQUENCE_RE = re.compile(r'^(.*?)[\._]*(\d+)\.([a-zA-Z0-9]+)$', re.IGNORECASE)
 
-logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler(rich_tracebacks=True, show_path=False, console=console)])
+logging.basicConfig(level="DEBUG", format="%(message)s", datefmt="[%X]", handlers=[RichHandler(rich_tracebacks=True, show_path=False, console=console)])
 log = logging.getLogger("rich")
 
 file_lock = Lock()
@@ -328,10 +328,23 @@ def archive_sequence_to_destination(job, dest_tar_path, progress_callback=None):
             for i, file_path in enumerate(source_files):
                 # Нормализуем путь для проверки существования файла
                 normalized_file_path = normalize_unicode_quotes(file_path)
+                
+                # Детальное логирование для диагностики
+                log.debug(f"Проверяем файл в секвенции:")
+                log.debug(f"  Оригинальный путь: {repr(file_path)}")
+                log.debug(f"  Нормализованный путь: {repr(normalized_file_path)}")
+                log.debug(f"  Существует (оригинальный): {os.path.exists(file_path)}")
+                log.debug(f"  Существует (нормализованный): {os.path.exists(normalized_file_path)}")
+                
                 if os.path.exists(normalized_file_path):
                     tar.add(normalized_file_path, arcname=os.path.basename(normalized_file_path))
+                elif os.path.exists(file_path):
+                    # Попробуем оригинальный путь если нормализованный не работает
+                    tar.add(file_path, arcname=os.path.basename(file_path))
+                    log.debug(f"Использован оригинальный путь вместо нормализованного")
                 else:
                     log.warning(f"В секвенции не найден файл: {file_path}")
+                    log.debug(f"Также проверен нормализованный путь: {normalized_file_path}")
                 if progress_callback:
                     progress_callback(i + 1, total_files)
         return True
@@ -563,14 +576,28 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
             if not is_dry_run:
                 # Нормализуем путь для проверки существования файла
                 normalized_source_key = normalize_unicode_quotes(absolute_source_key)
-                if not os.path.exists(normalized_source_key): 
+                
+                # Детальное логирование для диагностики
+                log.debug(f"Проверяем отдельный файл:")
+                log.debug(f"  Оригинальный путь: {repr(absolute_source_key)}")
+                log.debug(f"  Нормализованный путь: {repr(normalized_source_key)}")
+                log.debug(f"  Существует (оригинальный): {os.path.exists(absolute_source_key)}")
+                log.debug(f"  Существует (нормализованный): {os.path.exists(normalized_source_key)}")
+                
+                # Проверяем существование файла (сначала нормализованный, потом оригинальный)
+                if os.path.exists(normalized_source_key):
+                    actual_source_path = normalized_source_key
+                elif os.path.exists(absolute_source_key):
+                    actual_source_path = absolute_source_key
+                    log.debug(f"Использован оригинальный путь вместо нормализованного")
+                else:
                     raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 
-                # Используем нормализованный путь для копирования
+                # Используем найденный путь для копирования
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
                 # ... (блок rsync остается без изменений)
-                rsync_cmd = ["rsync", "-a", "--no-i-r", "--progress", normalized_source_key, dest_path]
+                rsync_cmd = ["rsync", "-a", "--no-i-r", "--progress", actual_source_path, dest_path]
                 status_queue.put((worker_id, {"status": "[blue]rsync...[/blue]"}))
                 process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
                 progress_re = re.compile(r'\s+(\d+)%')
