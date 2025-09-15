@@ -296,8 +296,10 @@ def archive_sequence_to_destination(job, dest_tar_path, progress_callback=None):
         total_files = len(source_files)
         with tarfile.open(dest_tar_path, "w") as tar:
             for i, file_path in enumerate(source_files):
-                if os.path.exists(file_path):
-                    tar.add(file_path, arcname=os.path.basename(file_path))
+                # Нормализуем путь для проверки существования файла
+                normalized_file_path = normalize_unicode_quotes(file_path)
+                if os.path.exists(normalized_file_path):
+                    tar.add(normalized_file_path, arcname=os.path.basename(normalized_file_path))
                 else:
                     log.warning(f"В секвенции не найден файл: {file_path}")
                 if progress_callback:
@@ -313,6 +315,34 @@ def parse_scientific_notation(size_str: str) -> int:
         if 'E' in cleaned_str.upper(): return int(float(cleaned_str))
         return int(cleaned_str)
     except (ValueError, TypeError): return 0
+
+def normalize_unicode_quotes(path: str) -> str:
+    """
+    Нормализует кавычки в путях файлов для устранения конфликтов между ASCII и Unicode кавычками.
+    Заменяет ASCII прямые кавычки на Unicode фигурные кавычки, которые используются в файловой системе.
+    Также обрабатывает случаи, когда в CSV отсутствуют открывающие кавычки.
+    """
+    # Сначала заменяем ASCII прямые кавычки " на Unicode фигурные кавычки "
+    normalized = path.replace('"', '"').replace('"', '"')
+    
+    # Обработка неполных кавычек: поиск паттерна вида "Слово"
+    # где отсутствует открывающая кавычка
+    import re
+    # Поиск паттерна: любой символ кроме " после которого следует слово заканчивающееся кавычкой
+    pattern = r'([^"\w])([\w\u0400-\u04FF]+)"'
+    matches = list(re.finditer(pattern, normalized))
+    
+    # Обрабатываем совпадения с конца строки, чтобы не сбить позиции
+    for match in reversed(matches):
+        start, end = match.span()
+        prefix_char = match.group(1)  # Символ перед словом
+        word = match.group(2)  # Слово без кавычек
+        
+        # Заменяем на правильный формат с обеими кавычками
+        replacement = f'{prefix_char}"{word}"'
+        normalized = normalized[:start] + replacement + normalized[end:]
+    
+    return normalized
 
 # --- Логика анализа и выполнения ---
 
@@ -501,11 +531,16 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
             # Для обычного файла - только его ключ
             source_keys_to_log = [absolute_source_key]
             if not is_dry_run:
-                if not os.path.exists(absolute_source_key): raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
+                # Нормализуем путь для проверки существования файла
+                normalized_source_key = normalize_unicode_quotes(absolute_source_key)
+                if not os.path.exists(normalized_source_key): 
+                    raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
+                
+                # Используем нормализованный путь для копирования
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
                 # ... (блок rsync остается без изменений)
-                rsync_cmd = ["rsync", "-a", "--no-i-r", "--progress", absolute_source_key, dest_path]
+                rsync_cmd = ["rsync", "-a", "--no-i-r", "--progress", normalized_source_key, dest_path]
                 status_queue.put((worker_id, {"status": "[blue]rsync...[/blue]"}))
                 process = subprocess.Popen(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
                 progress_re = re.compile(r'\s+(\d+)%')
