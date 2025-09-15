@@ -146,12 +146,42 @@ def find_sequences(dirs, config):
             if len(file_tuples) >= config.get('min_files_for_sequence', 50):
                 file_tuples.sort()
                 frames, full_paths, sizes = zip(*file_tuples)
+                
+                # Проверяем непрерывность последовательности
                 min_frame, max_frame = min(frames), max(frames)
-                safe_prefix = re.sub(r'[^\w\.\-]', '_', prefix.strip())
-                tar_filename = f"{safe_prefix}.{min_frame:04d}-{max_frame:04d}.{ext}.tar"
-                virtual_tar_path = os.path.join(dir_path, tar_filename)
-                all_sequences.append({'type': 'sequence', 'key': virtual_tar_path, 'dir_path': dir_path, 'tar_filename': tar_filename, 'source_files': list(full_paths), 'size': sum(sizes)})
-                sequence_files.update(full_paths)
+                expected_frames = max_frame - min_frame + 1
+                actual_frames = len(frames)
+                
+                # Разрешаем небольшие пропуски (например, до 5% от общего количества кадров)
+                max_allowed_gaps = max(1, int(expected_frames * 0.05))  # Максимум 5% пропусков
+                missing_frames = expected_frames - actual_frames
+                
+                if missing_frames <= max_allowed_gaps:
+                    # Это действительно секвенция с минимальными пропусками
+                    safe_prefix = re.sub(r'[^\w\.\-]', '_', prefix.strip())
+                    tar_filename = f"{safe_prefix}.{min_frame:04d}-{max_frame:04d}.{ext}.tar"
+                    virtual_tar_path = os.path.join(dir_path, tar_filename)
+                    all_sequences.append({
+                        'type': 'sequence', 
+                        'key': virtual_tar_path, 
+                        'dir_path': dir_path, 
+                        'tar_filename': tar_filename, 
+                        'source_files': list(full_paths), 
+                        'size': sum(sizes),
+                        'frame_info': {
+                            'min_frame': min_frame,
+                            'max_frame': max_frame,
+                            'expected_frames': expected_frames,
+                            'actual_frames': actual_frames,
+                            'missing_frames': missing_frames
+                        }
+                    })
+                    sequence_files.update(full_paths)
+                else:
+                    # Слишком много пропусков - не считаем секвенцией
+                    log.warning(f"Пропущена потенциальная секвенция {prefix} в {dir_path}: "
+                              f"слишком много пропусков ({missing_frames} из {expected_frames} кадров, "
+                              f"допустимо максимум {max_allowed_gaps})")
     return all_sequences, sequence_files
 
 def archive_sequence_to_destination(job, dest_tar_path):
