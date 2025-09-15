@@ -2,35 +2,84 @@
 # -*- coding: utf-8 -*-
 
 """
-Скрипт для исправления кавычек в CSV файлах.
-Очищает проблемные кавычки, которые вызывают проблемы с CSV парсингом.
+Скрипт для исправления путей в CSV файлах.
+Ищет реальные пути файлов на диске и заменяет проблемные пути.
 """
 
 import os
 import sys
+import glob
 from pathlib import Path
 
-def clean_quotes_in_path(path: str) -> str:
+def find_real_path(problematic_path: str) -> str:
     """
-    Очищает кавычки в пути от проблем с CSV экранированием.
-    Убирает внешние кавычки и заменяет двойные кавычки на одинарные.
+    Ищет реальный путь файла на диске, исходя из проблемного пути.
     """
-    # Убираем кавычки из начала и конца, если они есть
-    if path.startswith('"') and path.endswith('"'):
-        path = path[1:-1]
+    # Убираем все кавычки для поиска
+    clean_path = problematic_path.strip('"').replace('""', '"').rstrip('"')
     
-    # Заменяем двойные кавычки на правильные
-    path = path.replace('""', '"')
+    # Проверяем, существует ли путь как есть
+    if os.path.exists(clean_path):
+        return clean_path
     
-    # Если в пути есть проблемные кавычки в конце, убираем их
-    if path.endswith('"'):
-        path = path.rstrip('"')
+    # Если прямой путь не найден, пробуем найти похожий
+    try:
+        # Разбиваем путь на части
+        path_parts = clean_path.split('/')
+        
+        # Ищем от корня, проверяя каждую часть
+        current_search = '/'
+        
+        for i, part in enumerate(path_parts[1:], 1):  # пропускаем первую пустую часть
+            if not part:  # пропускаем пустые части
+                continue
+                
+            # Строим текущий путь
+            test_path = os.path.join(current_search, part)
+            
+            if os.path.exists(test_path):
+                current_search = test_path
+                continue
+            
+            # Если точного совпадения нет, ищем похожие папки/файлы
+            parent_dir = current_search
+            if os.path.exists(parent_dir) and os.path.isdir(parent_dir):
+                # Ищем в родительской папке
+                search_pattern = os.path.join(parent_dir, '*')
+                candidates = glob.glob(search_pattern)
+                
+                best_match = None
+                for candidate in candidates:
+                    candidate_name = os.path.basename(candidate)
+                    # Проверяем похожесть (убираем проблемные кавычки для сравнения)
+                    clean_candidate = candidate_name.replace('"', '')
+                    clean_part = part.replace('"', '')
+                    
+                    if clean_candidate == clean_part or clean_part in clean_candidate:
+                        best_match = candidate
+                        break
+                
+                if best_match:
+                    current_search = best_match
+                else:
+                    # Если не нашли, останавливаемся
+                    break
+            else:
+                break
+        
+        # Проверяем финальный путь
+        if os.path.exists(current_search) and current_search != '/':
+            return current_search
+            
+    except Exception as e:
+        print(f"Ошибка при поиске пути {clean_path}: {e}")
     
-    return path
+    # Если ничего не нашли, возвращаем очищенный путь
+    return clean_path
 
 def fix_csv_file(input_file: str, output_file: str):
     """
-    Исправляет кавычки в CSV файле, очищая их от проблем с экранированием.
+    Исправляет пути в CSV файле, ища реальные пути на диске.
     """
     fixed_count = 0
     total_count = 0
@@ -60,21 +109,27 @@ def fix_csv_file(input_file: str, output_file: str):
                 original_path = parts[0]
                 rest_part = parts[1]
                 
-                # Очищаем кавычки в пути
-                cleaned_path = clean_quotes_in_path(original_path)
+                # Ищем реальный путь на диске
+                real_path = find_real_path(original_path)
                 
                 # Проверяем, изменился ли путь
-                if original_path != cleaned_path:
+                if original_path != real_path:
                     fixed_count += 1
                     if fixed_count <= 5:  # Показываем первые 5 исправлений
                         print(f"Строка {line_num}:")
                         print(f"  Было:  {repr(original_path)}")
-                        print(f"  Стало: {repr(cleaned_path)}")
+                        print(f"  Стало: {repr(real_path)}")
+                        
+                        # Проверяем, существует ли найденный путь
+                        if os.path.exists(real_path):
+                            print(f"  ✅ Файл найден на диске")
+                        else:
+                            print(f"  ⚠️  Файл не найден (очищен путь)")
                         print()
                 
-                # Записываем исправленную строку
-                cleaned_line = cleaned_path + ';' + rest_part
-                outfile.write(cleaned_line + '\n')
+                # Записываем строку с найденным путем
+                fixed_line = real_path + ';' + rest_part
+                outfile.write(fixed_line + '\n')
                 
                 if line_num % 1000 == 0:
                     print(f"Обработано строк: {line_num}")
