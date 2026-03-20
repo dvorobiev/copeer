@@ -77,4 +77,9 @@ echo
 echo "  # Шаг 3: запустить копирование"
 echo "  python $COPEER_DIR/copeer.py -i $COPEER_DIR/output/copy_from_raidix_A1.csv"
 echo
+echo "  # Режим докопирования (если на диске уже часть данных):"
+echo "  python $COPEER_DIR/copeer.py -i $COPEER_DIR/output/copy_from_raidix_A1.csv \\"
+echo "    --single-dest /mnt/disk_A1 \\"
+echo "    --skip-existing"
+echo
 echo "  Замени /path/to/disks_files на каталог с CSV-листингами дисков (*_output_file.csv)"

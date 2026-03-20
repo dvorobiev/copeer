@@ -450,6 +450,68 @@ def analyze_and_plan_jobs(input_csv_path, config, processed_items_keys):
         "malformed_lines": malformed_lines, "total_found": len(all_files_from_csv)
     }
     return copy_jobs_to_process, archive_jobs_to_process, stats
+def compute_dest_path(job, dest_mount_point, config):
+    """Вычисляет путь назначения для задания."""
+    source_root = config.get('source_root')
+    destination_root = config.get('destination_root', '/')
+    absolute_source_key = job['key']
+    rel_path = (os.path.relpath(absolute_source_key, source_root)
+                if source_root and absolute_source_key.startswith(source_root)
+                else absolute_source_key.lstrip(os.path.sep))
+    return Path(os.path.normpath(os.path.join(dest_mount_point, destination_root.lstrip(os.path.sep), rel_path)))
+
+
+def preflight_skip_existing(copy_jobs, archive_jobs, single_dest, config):
+    """
+    Проверяет какие файлы/архивы уже есть на dest-диске.
+    Показывает отчёт и возвращает только те задания, которые нужно выполнить.
+    """
+    console.rule("[cyan]Pre-flight: проверка существующих файлов[/cyan]")
+    console.print(f"Режим: [bold]докопирование на[/bold] [green]{single_dest}[/green]")
+
+    already_done_copy, to_copy = [], []
+    already_done_archive, to_archive = [], []
+
+    with Progress(console=console, transient=True) as progress:
+        task = progress.add_task("[green]Проверка файлов...", total=len(copy_jobs) + len(archive_jobs))
+
+        for job in copy_jobs:
+            dest_path = compute_dest_path(job, single_dest, config)
+            try:
+                if dest_path.exists() and dest_path.stat().st_size == job['size']:
+                    already_done_copy.append(job)
+                else:
+                    to_copy.append(job)
+            except OSError:
+                to_copy.append(job)
+            progress.update(task, advance=1)
+
+        for job in archive_jobs:
+            dest_path = compute_dest_path(job, single_dest, config)
+            try:
+                if dest_path.exists():
+                    already_done_archive.append(job)
+                else:
+                    to_archive.append(job)
+            except OSError:
+                to_archive.append(job)
+            progress.update(task, advance=1)
+
+    already_size = sum(j['size'] for j in already_done_copy) + sum(j['size'] for j in already_done_archive)
+    to_do_size = sum(j['size'] for j in to_copy) + sum(j['size'] for j in to_archive)
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Параметр", style="cyan", no_wrap=True)
+    table.add_column("Значение", style="white", justify="right")
+    table.add_row("Всего заданий:", f"{len(copy_jobs) + len(archive_jobs):,}")
+    table.add_row("Уже есть на диске (пропустить):", f"[dim]{len(already_done_copy) + len(already_done_archive):,}[/dim] ({decimal(already_size)})")
+    table.add_row("Нужно скопировать:", f"[yellow]{len(to_copy) + len(to_archive):,}[/yellow] ({decimal(to_do_size)})")
+    console.print(table)
+    console.print()
+
+    return to_copy, to_archive
+
+
 # Замените эту функцию целиком
 def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
     while True:
@@ -511,7 +573,7 @@ def show_summary_and_confirm(copy_jobs, archive_jobs, stats):
 # ИСПРАВЛЕНО: Явно принимает is_dry_run
 # Замените эту функцию целиком
 # Замените эту функцию целиком
-def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debug_mode, progress_callback=None):
+def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debug_mode, progress_callback=None, single_dest=None, skip_existing=False):
     """
     Обрабатывает задание, отправляет обновления в очередь и корректно логирует ошибки
     как для отдельных файлов, так и для секвенций.
@@ -521,7 +583,7 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
     status_queue.put((worker_id, {"status": op_type_text, "job": job, "progress": 0, "disk_idx": None}))
 
     try:
-        dest_mount_point = disk_manager.get_current_destination(job['size'])
+        dest_mount_point = single_dest if single_dest else disk_manager.get_current_destination(job['size'])
 
         disk_idx = '?'
         try:
@@ -544,6 +606,9 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
             # Для секвенций в лог состояния пойдут все исходные файлы
             source_keys_to_log = job.get('source_files', [])
             if not is_dry_run:
+                if skip_existing and Path(dest_path).exists():
+                    status_queue.put((worker_id, {"status": "[dim]Пропущен[/dim]", "progress": 100}))
+                    return (job['type'], job['size'], source_keys_to_log, dest_path)
                 if not archive_sequence_to_destination(job, dest_path, progress_callback):
                     raise RuntimeError(f"Не удалось создать архив {short_name}")
             else: # Dry-run симуляция
@@ -575,6 +640,15 @@ def process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debu
                     raise FileNotFoundError(f"Исходный файл не найден: {absolute_source_key}")
                 
                 # Используем найденный путь для копирования
+                if skip_existing:
+                    dest_p = Path(dest_path)
+                    try:
+                        if dest_p.exists() and dest_p.stat().st_size == job['size']:
+                            status_queue.put((worker_id, {"status": "[dim]Пропущен[/dim]", "progress": 100}))
+                            return (job['type'], job['size'], source_keys_to_log, dest_path)
+                    except OSError:
+                        pass
+
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
                 # ... (блок rsync остается без изменений)
@@ -762,9 +836,23 @@ def main(args):
     if not show_summary_and_confirm(copy_jobs, archive_jobs, stats):
         console.print("[yellow]Выполнение отменено пользователем.[/yellow]"); sys.exit(0)
 
+    # Режим докопирования: фильтруем уже существующие файлы
+    if args.skip_existing and args.single_dest:
+        copy_jobs, archive_jobs = preflight_skip_existing(copy_jobs, archive_jobs, args.single_dest, config)
+        if not copy_jobs and not archive_jobs:
+            console.print("[green]Все файлы уже есть на диске. Нечего копировать.[/green]")
+            return
+    elif args.skip_existing and not args.single_dest:
+        console.print("[bold yellow]Предупреждение: --skip-existing без --single-dest работает в режиме проверки внутри воркера (без pre-flight отчёта).[/bold yellow]")
+
+    # Используем single-dest как единственную точку монтирования, если задана
+    mount_points_for_manager = [args.single_dest] if args.single_dest else config['mount_points']
+    if args.single_dest:
+        console.print(f"Режим [bold]single-dest[/bold]: все задания направляются на [green]{args.single_dest}[/green]")
+
 # Создаем настоящий DiskManager всегда, но передаем ему флаг is_dry_run
     disk_manager = DiskManager(
-        config['mount_points'],
+        mount_points_for_manager,
         config['threshold'],
         config.get('disk_strategy', 'fill'),
         is_dry_run=is_dry_run,
@@ -809,8 +897,8 @@ def main(args):
                             worker_id = get_worker_id()
                             if worker_id is None: time.sleep(0.1)
                         try:
-                            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Явная передача флагов
-                            return process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debug_mode)
+                            return process_job_worker(worker_id, job, config, disk_manager, is_dry_run, is_debug_mode,
+                                                      single_dest=args.single_dest, skip_existing=args.skip_existing)
                         finally: release_worker_id(worker_id)
 
                     active_futures = {executor.submit(job_wrapper, job) for job in copy_jobs}
@@ -848,7 +936,7 @@ def main(args):
                         def progress_callback(current, total):
                             status_queue.put((1, {"progress": (current / total) * 100}))
 
-                        future = executor.submit(process_job_worker, 1, job, config, disk_manager, is_dry_run, is_debug_mode, progress_callback)
+                        future = executor.submit(process_job_worker, 1, job, config, disk_manager, is_dry_run, is_debug_mode, progress_callback, args.single_dest, args.skip_existing)
 
                         while not future.done():
                             while not status_queue.empty():
@@ -883,5 +971,9 @@ if __name__ == "__main__":
     source_group.add_argument("-s", "--source-dir", help="Путь к исходной директории для сканирования.")
     parser.add_argument("--dry-run", action="store_true", help="Выполнить анализ без реального копирования.")
     parser.add_argument("--mode", choices=['all', 'copy', 'archive'], default='all', help="Режим работы: 'all' - всё (по умолчанию), 'copy' - только копирование, 'archive' - только архивация.")
+    parser.add_argument("--single-dest", metavar='PATH',
+                        help="Копировать всё на один диск (режим докопирования). Обходит DiskManager.")
+    parser.add_argument("--skip-existing", action='store_true',
+                        help="Пропускать файлы, которые уже существуют на dest-диске и совпадают по размеру.")
     args = parser.parse_args()
     main(args)
