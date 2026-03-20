@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Сравнение покрытия файлов диска на RAIDIX.
+Сравнение покрытия файлов диска на RAIDIX или примонтированном диске.
 
 Использование:
+  # Проверка против RAIDIX (по умолчанию)
   python compare_disk_raidix.py --disk A1 --disks-dir /path/to/disks_files
   python compare_disk_raidix.py --all --disks-dir /path/to/disks_files
   python compare_disk_raidix.py --disk A1 --missing
+
+  # Обратная проверка: все ли файлы из CSV есть на физическом диске
+  python compare_disk_raidix.py --disk B2 --disks-dir disk_state --dest-mount /mnt/slot3
+  python compare_disk_raidix.py --disk B2 --disks-dir disk_state --dest-mount /mnt/slot3 --missing
 """
 
 import argparse
@@ -25,6 +30,18 @@ def disk_path_to_raidix(full_path: str, raidix_root: str) -> str | None:
     m = re.match(r'^/mnt/disk_[^/]+/raidix/(.*)', full_path)
     if m:
         return os.path.join(raidix_root, m.group(1))
+    return None
+
+
+def disk_path_to_mount(full_path: str, dest_mount: str) -> str | None:
+    """Канонизация пути с диска в путь на примонтированном диске.
+
+    Берёт всё после /mnt/disk_XX/ и подставляет под dest_mount.
+    Пример: /mnt/disk_B2/raidix/foo/bar.ext -> /mnt/slot3/raidix/foo/bar.ext
+    """
+    m = re.match(r'^/mnt/disk_[^/]+/(.*)', full_path)
+    if m:
+        return os.path.join(dest_mount, m.group(1))
     return None
 
 
@@ -51,14 +68,18 @@ def check_exists(raidix_path: str) -> bool:
 
 
 def process_disk(disk: str, disks_dir: Path, raidix_root: str,
-                 save_missing: bool, output_dir: Path) -> dict:
+                 save_missing: bool, output_dir: Path,
+                 dest_mount: str | None = None) -> dict:
     rows = load_disk_files(disk, disks_dir)
     total = len(rows)
 
     pairs = []
     skipped = 0
     for orig_path, *_ in rows:
-        rp = disk_path_to_raidix(orig_path, raidix_root)
+        if dest_mount:
+            rp = disk_path_to_mount(orig_path, dest_mount)
+        else:
+            rp = disk_path_to_raidix(orig_path, raidix_root)
         if rp:
             pairs.append((orig_path, rp))
         else:
@@ -78,7 +99,8 @@ def process_disk(disk: str, disks_dir: Path, raidix_root: str,
 
     if save_missing:
         output_dir.mkdir(parents=True, exist_ok=True)
-        out_file = output_dir / f"missing_on_raidix_{disk}.csv"
+        label = dest_mount.replace("/", "_").strip("_") if dest_mount else f"raidix_{disk}"
+        out_file = output_dir / f"missing_on_{label}_{disk}.csv"
         with open(out_file, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f, delimiter=";", quotechar='"', quoting=csv.QUOTE_ALL)
             for p in sorted(missing_paths):
@@ -94,15 +116,15 @@ def process_disk(disk: str, disks_dir: Path, raidix_root: str,
     }
 
 
-def print_result(r: dict):
+def print_result(r: dict, dest_label: str = "RAIDIX"):
     total = r["total"]
     found = r["found"]
     missing = r["missing"]
     pct_found = (found / total * 100) if total else 0
     pct_missing = (missing / total * 100) if total else 0
     print(f"\nДиск {r['disk']}: {total:,} файлов")
-    print(f"  ✓ На RAIDIX:      {found:>8,} ({pct_found:.1f}%)")
-    print(f"  ✗ Нет на RAIDIX:  {missing:>8,} ({pct_missing:.1f}%)")
+    print(f"  ✓ На {dest_label}:  {found:>8,} ({pct_found:.1f}%)")
+    print(f"  ✗ Нет на {dest_label}:  {missing:>8,} ({pct_missing:.1f}%)")
     if r["skipped"]:
         print(f"  ? Пропущено:      {r['skipped']:>8,} (нераспознанный путь)")
 
@@ -122,29 +144,39 @@ def main():
     parser.add_argument("--output-dir", default="output", metavar="DIR",
                         help="Каталог для выходных файлов (по умолчанию: output)")
     parser.add_argument("--missing", action="store_true",
-                        help="Сохранить список отсутствующих в --output-dir/missing_on_raidix_{DISK}.csv")
+                        help="Сохранить список отсутствующих файлов в --output-dir/")
     parser.add_argument("--raidix-root", default=DEFAULT_RAIDIX_ROOT,
                         help=f"Корень RAIDIX (по умолчанию: {DEFAULT_RAIDIX_ROOT})")
+    parser.add_argument("--dest-mount", metavar="PATH",
+                        help="Обратная проверка: путь к примонтированному диску (например, /mnt/slot3). "
+                             "Проверяет что все файлы из CSV физически есть на этом диске.")
     args = parser.parse_args()
 
     disks_dir = Path(args.disks_dir)
     output_dir = Path(args.output_dir)
+    dest_mount = args.dest_mount
 
     if not disks_dir.exists():
         print(f"Ошибка: каталог {disks_dir} не найден", file=sys.stderr)
         sys.exit(1)
+
+    if dest_mount:
+        print(f"Режим: обратная проверка против {dest_mount}")
+        dest_label = dest_mount
+    else:
+        dest_label = "RAIDIX"
 
     disks = get_all_disks(disks_dir) if args.all else [args.disk]
 
     results = []
     for disk in disks:
         print(f"Обрабатываю диск {disk}...", end=" ", flush=True)
-        r = process_disk(disk, disks_dir, args.raidix_root, args.missing, output_dir)
+        r = process_disk(disk, disks_dir, args.raidix_root, args.missing, output_dir, dest_mount)
         results.append(r)
         print("готово")
 
     for r in results:
-        print_result(r)
+        print_result(r, dest_label)
 
     if args.all and len(results) > 1:
         total_all = sum(r["total"] for r in results)
@@ -154,8 +186,8 @@ def main():
         pct_miss = (missing_all / total_all * 100) if total_all else 0
         print(f"\n{'─' * 45}")
         print(f"Итого ({len(results)} дисков): {total_all:,} файлов")
-        print(f"  ✓ На RAIDIX:      {found_all:>8,} ({pct:.1f}%)")
-        print(f"  ✗ Нет на RAIDIX:  {missing_all:>8,} ({pct_miss:.1f}%)")
+        print(f"  ✓ На {dest_label}:  {found_all:>8,} ({pct:.1f}%)")
+        print(f"  ✗ Нет на {dest_label}:  {missing_all:>8,} ({pct_miss:.1f}%)")
 
 
 if __name__ == "__main__":
