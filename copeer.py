@@ -147,9 +147,9 @@ class DiskManager:
         self.next_disk_index = 0
         self.lock = Lock()
 
-        log.info(f"Стратегия распределения по дискам: [bold cyan]{self.strategy}[/bold cyan]")
+        log.info(f"Стратегия распределения по дискам: {self.strategy}")
         if self.strategy == 'round_robin':
-            log.info(f"Максимальное кол-во одновременно используемых дисков (в приоритете): [bold cyan]{self.max_concurrent_disks}[/bold cyan]")
+            log.info(f"Максимальное кол-во одновременно используемых дисков (в приоритете): {self.max_concurrent_disks}")
         self._select_initial_disk()
 
     def _get_disk_usage(self, path):
@@ -188,7 +188,7 @@ class DiskManager:
         for mount in self.mount_points:
             if self._is_disk_suitable(mount):
                 self.active_disk = mount
-                log.info(f"Найден как минимум один доступный диск для начала работы: [bold green]{self.active_disk}[/bold green]")
+                log.info(f"Найден как минимум один доступный диск для начала работы: {self.active_disk}")
                 return
         log.error("🛑 Не найдено подходящих дисков для начала работы.")
         raise RuntimeError("Не найдено подходящих дисков")
@@ -256,7 +256,7 @@ def load_previous_state(state_file, processed_items_keys):
             with open(state_file, 'r', encoding='utf-8') as f:
                 for row in csv.reader(f):
                     if row: processed_items_keys.add(row[0])
-            log.info(f"Загружено [bold]{len(processed_items_keys)}[/bold] записей из файла состояния.")
+            log.info(f"Загружено {len(processed_items_keys)} записей из файла состояния.")
         except Exception as e: log.error(f"Не удалось прочитать файл состояния {state_file}: {e}")
 
 def write_log(state_log_file, mapping_log_file, key, dest_path=None, is_dry_run=False):

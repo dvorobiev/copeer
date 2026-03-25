@@ -21,6 +21,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+csv.field_size_limit(sys.maxsize)
+
 DEFAULT_RAIDIX_ROOT = "/mnt/cifs/raidix"
 WORKERS = 32
 
